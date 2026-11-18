@@ -22,6 +22,15 @@ guard 的非 None 返回属于契约违规，不能被回调异常包装成主�
 selector 和真实 metadata/spawn 门禁。双宿主 import 探针拒绝框架/Torch/
 kernel/provider import；named consumer 回归不得冒称 SGLang engine 试验。
 
+vLLM 的 CPU 宿主边界夹具要显式选择无关 owner 的 stock 策略，保留真实 host
+health、锁与失败锁存；只对声明范围外的注册动作提供替身，不全局关闭 owner
+检查。环境键以注册表为准（如 `HCU_VLLM_MHC_IMPL`，不是 `HCU_VLLM_MHC`）。
+`tests/adapter/_vllm_runtime_fixtures.py` 供这类夹具显式调用；owner 自身的准入、
+发布、数值和 Graph 套件保留真实策略。AOT hash 契约可只替身硬件 fingerprint，
+保留官方两个 hash collector 和 Inductor 配置；Worker mutation 夹具提供空 CPU
+Module、transfer model 与实际 runner 的 speculator 字段，继续执行官方遍历和
+guard。隐藏设备通过不能替代有设备可见的正式宿主车道；分别记录每文件结果。
+
 vLLM 扩展生命周期：source 与独立 wheel installed 分开跑。check_health 的
 必需参数须在激活前拒绝；报告替换/重复、sink 失败、caught error 后其他
 selector、实际 fork 格式化窗口均需断言。public registry clear/foreign 必须

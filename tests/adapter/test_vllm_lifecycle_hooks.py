@@ -6,6 +6,7 @@
 from types import SimpleNamespace as NS
 
 import pytest
+from _vllm_runtime_fixtures import stock_unrelated_owners
 
 from hcu_adapter import model_load as api
 
@@ -20,6 +21,7 @@ import test_vllm_post_model_load as helpers
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
     import torch
+    stock_unrelated_owners(monkeypatch)
     assert not torch.cuda.is_initialized()
     envs.disable_envs_cache()
     monkeypatch.setattr(api, "_callbacks", api._Callbacks())
@@ -74,6 +76,7 @@ def test_public_pair_real_load_then_real_mutation_entry(monkeypatch, version, op
     runner.reset_encoder_cache = lambda: events.append("reset-encoder")
     runner.reset_mm_cache = lambda: events.append("reset-mm")
     worker.weight_transfer_engine = NS(
+        model=runner.model,
         supports_draft_weight_update=True,
         start_weight_update=lambda: events.append("CPU-transfer-start"),
         reset_weight_update_target=lambda: events.append("CPU-transfer-reset"),

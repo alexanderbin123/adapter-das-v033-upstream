@@ -14,6 +14,7 @@ import threading
 from types import ModuleType, SimpleNamespace as NS
 
 import pytest
+from _vllm_runtime_fixtures import stock_unrelated_owners, stub_runtime_registrations
 
 from hcu_adapter import extensions as ext
 from hcu_adapter.bridges import vllm as bridge
@@ -40,6 +41,8 @@ class Point:
 
 @pytest.fixture
 def startup(monkeypatch):
+    stock_unrelated_owners(monkeypatch)
+    stub_runtime_registrations(monkeypatch)
     monkeypatch.setattr(bridge, "_RUNTIME_ACTIONS", bridge.ProcessLocalActions())
     monkeypatch.setattr(bridge, "detect_hcu", lambda: bridge.HcuDetection(True, "gfx936", "CPU double"))
     monkeypatch.setattr(bridge, "_ensure_vllm_compatible", lambda: "0.32.0+cpu")

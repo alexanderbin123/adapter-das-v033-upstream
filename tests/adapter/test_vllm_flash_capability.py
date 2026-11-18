@@ -8,6 +8,7 @@ import os
 import sys
 
 import pytest
+from _vllm_runtime_fixtures import stock_unrelated_owners
 
 from hcu_adapter.bridges import vllm as bridge
 from hcu_adapter.extensions import ExtensionReport, ExtensionStatus
@@ -23,6 +24,7 @@ def report(name="flash", status=ExtensionStatus.ACTIVE, capabilities=(CAP,)):
 @pytest.fixture
 def platform(monkeypatch):
     """CPU platform/config doubles; real Adapter selector/report storage."""
+    stock_unrelated_owners(monkeypatch)
     class RocmPlatform:
         @classmethod
         def get_device_capability(cls):

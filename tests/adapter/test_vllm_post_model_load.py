@@ -15,6 +15,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
 import pytest
+from _vllm_runtime_fixtures import stock_unrelated_owners
 
 pytest.importorskip("vllm")
 from vllm import envs
@@ -38,6 +39,7 @@ from hcu_adapter.extensions import ExtensionContext, ExtensionSpec, activate_ext
 
 @pytest.fixture(autouse=True)
 def isolation(monkeypatch):
+    stock_unrelated_owners(monkeypatch)
     envs.disable_envs_cache()
     monkeypatch.setattr(api, "_callbacks", api._Callbacks())
     monkeypatch.delenv("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH", raising=False)
@@ -150,7 +152,10 @@ def make_runner(monkeypatch, cfg, version, events, fail_at=None):
     """Execute the complete real runner load_model with CPU provider doubles."""
     module = v1 if version == 1 else v2
     runner = object.__new__(module.GPUModelRunner)
-    model = NS()  # No torch model or checkpoint is created/loaded.
+    # Real v0.33 weight-update validation traverses the loaded Module. Keep
+    # that traversal with an empty CPU model; no checkpoint is created/loaded.
+    from torch.nn import Module
+    model = Module()
     def load_target(**kwargs):
         assert kwargs["vllm_config"] is cfg
         events.append("target-pack")
@@ -232,6 +237,7 @@ class _Memory:
 
 def prepare_wrapper(monkeypatch, cfg, runner, events, callback, *, real_plugins=False):
     """Keep official WorkerWrapper.init_worker + Worker.load_model intact."""
+    stock_unrelated_owners(monkeypatch)
     import vllm.plugins
     def activate(context):
         events.append("activate")

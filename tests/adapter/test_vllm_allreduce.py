@@ -16,6 +16,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 import pytest
 import torch
+from _vllm_runtime_fixtures import stock_unrelated_owners, stub_runtime_registrations
 from hcu_adapter import registry as adapter_registry, allreduce_aiter
 from hcu_adapter.allreduce import MIB
 from hcu_adapter.extensions import ExtensionCommitError
@@ -286,6 +287,13 @@ def test_exact_target_and_declared_phase_origins():
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
     assert not torch.cuda.is_initialized()
+    stock_unrelated_owners(monkeypatch)
+    stub_runtime_registrations(monkeypatch, preserve=("vllm_allreduce",))
+    # Keep both real vLLM hash collectors and Inductor configuration hashing;
+    # this CPU contract doubles only the unrelated hardware fingerprint.
+    from torch._inductor.codecache import CacheBase
+    monkeypatch.setattr(CacheBase, "get_system", staticmethod(
+        lambda: {"hash": "CPU hardware metadata fixture"}))
     envs.disable_envs_cache()
     registry = dict(envs.environment_variables)
     monkeypatch.setattr(adapter_registry, "_RECORDS", {})
@@ -300,7 +308,8 @@ def isolated(monkeypatch):
     for name, value in (("_installed", None), ("_bindings", None), ("_attempted", False),
                         ("_commit_failure", None), ("_fork_error", False), ("_installing", False)):
         monkeypatch.setattr(compat, name, value)
-    monkeypatch.setattr(bridge, "detect_hcu", lambda: SimpleNamespace(detected=True))
+    monkeypatch.setattr(bridge, "detect_hcu", lambda: bridge.HcuDetection(
+        True, "gfx936", "CPU identity fixture"))
     # These tests exercise official AR Python/dispatcher behavior, not the
     # independently admitted HIP loader or FP8 registration. The production
     # admission order is covered with the real loader seam in runtime_abi.

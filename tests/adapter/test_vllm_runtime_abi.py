@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _vllm_runtime_fixtures import stock_unrelated_owners, stub_runtime_registrations
 
 from hcu_adapter.bridges import vllm as bridge
 
@@ -16,6 +17,8 @@ from hcu_adapter.bridges import vllm as bridge
 def startup(monkeypatch):
     calls = []
     failure = []
+    stock_unrelated_owners(monkeypatch)
+    stub_runtime_registrations(monkeypatch, preserve=("vllm_fp8", "vllm_allreduce"))
 
     class OfficialWrapper:
         def __init__(self):
