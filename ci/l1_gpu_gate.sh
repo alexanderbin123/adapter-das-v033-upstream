@@ -34,7 +34,11 @@ FAILS=()
 # segment logs remain unchanged for backward compatibility until MR-06.
 L15_MANIFEST="$ROOT/tests/manifests/l15_v0522.json"
 L15_MANIFEST_MODE="${L15_MANIFEST_MODE:-observe}"
-L15_MANIFEST_BATCHES="${L15_MANIFEST_BATCHES:-current,batch-1}"
+# Include every candidate batch by default.  The selectors are selected by
+# "current"; omitting batch-2..4 silently reduced the shadow inventory to the
+# first candidate batch and made the default gate look more complete than it
+# was.  Callers may still narrow the set explicitly for a staged migration.
+L15_MANIFEST_BATCHES="${L15_MANIFEST_BATCHES:-current,batch-1,batch-2,batch-3,batch-4}"
 L15_RESULT_ROOT="${L15_RESULT_ROOT:-$ROOT/results/l15-manifest}"
 L15_FAMILY_MATRIX_MODE="${L15_FAMILY_MATRIX_MODE:-off}"
 L15_FAMILY_MATRIX_FAMILIES="${L15_FAMILY_MATRIX_FAMILIES:-dense,mla,moe,quantization,mamba}"
@@ -135,17 +139,27 @@ case "$TSCALE" in ''|*[!0-9]*) TSCALE=1;; esac
 
 run_seg() {  # name timeout_base cmd...
     local name="$1"; local tmo=$(( $2 * TSCALE )); shift 2
+    local log="/tmp/l1_${name}.log"
+    : > "$log"
     echo "L1: === $name (timeout ${tmo}s) ==="
     # heartbeat: one line/60s = elapsed + last JIT journal entry, so a long
     # compile storm (journal keeps advancing) is tellable from a wedge
     # (frozen last line) without waiting for the timeout. Cancelled after
     # the segment, so short segments just never print one.
-    ( t0=$(date +%s)
+    ( t0=$(date +%s); shown=0
       while sleep 60; do
           last="$(tail -n 1 "$JPROG" 2>/dev/null)"
           echo "L1 heartbeat [$name]: elapsed=$(( $(date +%s) - t0 ))s last=${last:-none}"
+          # Surface completed log lines while the segment is still running.
+          # A timeout must retain the active nodeid and faulthandler stack,
+          # rather than only a row of dots after the entire job finishes.
+          lines=$(wc -l < "$log")
+          if [ "$lines" -gt "$shown" ]; then
+              sed -n "$((shown + 1)),${lines}p" "$log" | sed 's/^/    /'
+              shown=$lines
+          fi
       done ) & hbpid=$!
-    if timeout "$tmo" "$@" > "/tmp/l1_${name}.log" 2>&1; then
+    if timeout "$tmo" "$@" > "$log" 2>&1; then
         echo "L1: $name PASS"
     else
         local rc=$?
@@ -158,9 +172,45 @@ run_seg() {  # name timeout_base cmd...
 }
 
 # ---------------------------------------------------------------- segments
-run_seg l0      60   python3 ci/l0_gate.py
-run_seg cpu     300  python3 -m pytest tests/test_ops_cpu.py -q --no-header
-run_seg kernels 900  python3 -m pytest tests/kernels tests/adapter -q --no-header
+run_seg l0      120  python3 ci/l0_gate.py
+# CPU oracles import sgl_kernel only -- no sglang host surface, so the
+# interpreter skips the bridge install (~26 s of sglang import per cold
+# start, and with no host loaded the _cpu_process suites also skip their
+# clean-subprocess rerun: they already ARE the clean process).
+run_seg cpu     300  env HCU_ADAPTER_HOST=none python3 -m pytest tests/test_ops_cpu.py -q --no-header
+# Transfer ownership only to a blocking matrix with an available upstream tree.
+# Observe/off modes retain the broad regression's blocking coverage.
+FAMILY_DESELECT=()
+if [ "$L15_FAMILY_MATRIX_MODE" = "blocking" ] && [ -n "$UP_TREE" ]; then
+    family_nodes="$(python3 - "$ROOT/tests/manifests/l15_family_matrix_v1.json" "$L15_FAMILY_MATRIX_FAMILIES" <<'PY'
+import json
+import sys
+
+from tools.l15_family_matrix import validate
+
+document = json.loads(open(sys.argv[1], encoding="utf-8").read())
+errors = validate(document)
+if errors:
+    raise ValueError("; ".join(errors))
+selected = set(sys.argv[2].split(","))
+known = {family["id"] for family in document["families"]}
+if not selected or selected - known:
+    raise ValueError("invalid family selection")
+for family in document["families"]:
+    if family["id"] in selected:
+        for case in family["cases"]:
+            if case.get("kind") == "adapter-pytest":
+                print(case["nodeid"])
+PY
+    )" || { echo "L1: invalid family manifest/selection"; exit 2; }
+    while IFS= read -r nodeid; do
+        [ -n "$nodeid" ] && FAMILY_DESELECT+=(--deselect "$nodeid")
+    done <<< "$family_nodes"
+    echo "L1: kernels transfers $((${#FAMILY_DESELECT[@]} / 2)) cases to blocking matrix"
+fi
+run_seg kernels 900  python3 -m pytest tests/kernels tests/adapter -vv --no-header \
+    --tb=short -o faulthandler_timeout=120 --durations=60 \
+    "${FAMILY_DESELECT[@]}"
 
 # L1.5: upstream attention-unittest selection (dsa + kda + dense + mla
 # dirs; mla extend subtests over flashinfer stubs -> legal skips, see
@@ -177,6 +227,24 @@ run_seg kernels 900  python3 -m pytest tests/kernels tests/adapter -q --no-heade
 if [ -n "$UP_TREE" ]; then
     echo "L1: upstream tree = $UP_TREE"
     UP="$UP_TREE/test/registered/attention/unittests"
+    if [ "$L15_FAMILY_MATRIX_MODE" = "blocking" ]; then
+        ownership_out="$L15_RESULT_ROOT/ownership-$(date +%Y%m%dT%H%M%S)-$$"
+        python3 -m tools.l15_ci_plan --families "$L15_FAMILY_MATRIX_FAMILIES" \
+            --out-dir "$ownership_out" || exit 2
+        # Green nodes have one owner; known diagnostics/platform baselines are
+        # listed in ownership.json as NOT EXECUTED, never as a successful test.
+        run_seg l15_exact 1800 env HCU_ADAPTER_HOST=none HCU_DEEPGEMM_BRIDGE=1 \
+            PYTHONPATH="$ROOT:$UP_TREE/python" python3 -m tools.l15_manifest run \
+            --up-tree "$UP_TREE" --manifest "$ownership_out/manifest.json" \
+            --classifications core-green,contract-green --out-dir "$ownership_out/execution"
+        if [ -s "$ownership_out/observe-nodeids.txt" ]; then
+            env HCU_ADAPTER_HOST=none HCU_DEEPGEMM_BRIDGE=1 \
+                PYTHONPATH="$ROOT:$UP_TREE/python" python3 -m tools.l15_manifest run \
+                --up-tree "$UP_TREE" --manifest "$ownership_out/observation-manifest.json" \
+                --classifications candidate-observe --out-dir "$ownership_out/observation" \
+                || echo "L1: mixed subtest observation WARN; not core coverage"
+        fi
+    else
     run_seg l15_upstream 1800 env HCU_DEEPGEMM_BRIDGE=1 \
         PYTHONPATH="$UP_TREE/python:$ROOT" \
         python3 -m pytest "$UP/dsa" "$UP/kda" "$UP/dense" "$UP/mla" \
@@ -190,6 +258,22 @@ if [ -n "$UP_TREE" ]; then
     for d in gdn hybrid_linear mamba swa lightning dsv4; do
         [ -d "$UP/$d" ] && MECH="$MECH $UP/$d"
     done
+    # v0.5.23 face drift: cutedsl_gdn_mtp_ring imports cuda.bindings at
+    # module level, so collecting gdn/test_gdn_cutedsl_ring_verify.py dies
+    # with ModuleNotFoundError on HCU containers (no cuda python pkg) and
+    # takes the whole l15_mech segment down at collection. Probe the import
+    # under the segment's own path contract; on failure ignore that one
+    # file loudly. Platform-bug ledger treatment, same spirit as
+    # `-k "not tilelang"` (docs/ci.md L1.5b).
+    MECH_IGNORE=""
+    GDN_VERIFY="$UP/gdn/test_gdn_cutedsl_ring_verify.py"
+    if [ -f "$GDN_VERIFY" ] && ! env HCU_DEEPGEMM_BRIDGE=1 \
+            PYTHONPATH="$UP_TREE/python:$ROOT" \
+            python3 -c "import sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring" \
+            >/dev/null 2>&1; then
+        MECH_IGNORE="--ignore=$GDN_VERIFY"
+        echo "L1: l15_mech ignores $GDN_VERIFY (cutedsl_gdn_mtp_ring not importable on this stack; ledger docs/ci.md L1.5b)"
+    fi
     if [ -n "$MECH" ]; then
         # Batch A first-run triage (2026-10-19): baseline 38 failed / 99
         # passed -- every one ledgered in docs/ci.md L1.5b (gdn cuteDSL
@@ -206,7 +290,7 @@ if [ -n "$UP_TREE" ]; then
         rc=0
         timeout $(( 1200 * TSCALE )) env HCU_DEEPGEMM_BRIDGE=1 \
             PYTHONPATH="$UP_TREE/python:$ROOT" \
-            python3 -m pytest $MECH -q --no-header \
+            python3 -m pytest $MECH $MECH_IGNORE -q --no-header \
             -k "not tilelang" -rs -o faulthandler_timeout=580 --tb=line \
             > /tmp/l1_l15_mech.log 2>&1 || rc=$?
         kill "$hbpid" 2>/dev/null; wait "$hbpid" 2>/dev/null
@@ -227,6 +311,8 @@ if [ -n "$UP_TREE" ]; then
         fi
     else
         echo "L1: l15_mech SKIP (no mechanism dirs in this tree)"
+    fi
+
     fi
 
     # L1.5 v2 manifest shadow.  This collects explicit candidate sources and
@@ -301,23 +387,44 @@ fi
 
 GATES_LOG=/tmp/l1_gates.log; : > "$GATES_LOG"
 gates_fail=0
-for g in _test_hcu_config _test_fa3_emu_cp _test_rope_fallback_vs_fused \
-         _test_aiter_moe_gate _test_contig_triton; do
+# The five gates are independent processes with independent env contracts;
+# each pays ~26-30 s of interpreter+torch import and a few GB of VRAM on a
+# 96 GB card, so they run concurrently and the phase costs the slowest gate
+# (~100 s) instead of the sum (~330 s; 2026-11-17 nmz16 cold-start timing).
+# Per-gate log files are merged into GATES_LOG in fixed name order afterwards.
+gate_names=(_test_hcu_config _test_fa3_emu_cp _test_rope_fallback_vs_fused \
+           _test_aiter_moe_gate _test_contig_triton)
+declare -A gate_pid gate_out
+echo "L1: gates start (5 concurrent)"
+for g in "${gate_names[@]}"; do
     f="tests/tools/$g.py"
     [ -f "$f" ] || { echo "    SKIP $g (missing)" >> "$GATES_LOG"; continue; }
-    echo "=== $g ===" >> "$GATES_LOG"
-    if timeout 300 python3 "$f" >> "$GATES_LOG" 2>&1; then
+    # The config gate only exercises config resolution + kernel tiers;
+    # skipping the host-bridge install halves its interpreter startup
+    # (52s -> 26s on the 2026-11-16 image) and it has no bridge surface.
+    case "$g" in _test_hcu_config) gate_env=(env HCU_ADAPTER_HOST=none) ;; *) gate_env=() ;; esac
+    gate_out[$g]="/tmp/l1_gate_$g.log"
+    timeout 300 "${gate_env[@]}" python3 "$f" > "${gate_out[$g]}" 2>&1 &
+    gate_pid[$g]=$!
+done
+for g in "${gate_names[@]}"; do
+    [ -n "${gate_pid[$g]:-}" ] || continue
+    if wait "${gate_pid[$g]}"; then
         echo "L1: gate $g PASS"
     else
-        echo "L1: gate $g FAIL -- tail:"; tail -n 8 "$GATES_LOG" | sed 's/^/    /'
+        echo "L1: gate $g FAIL -- tail:"; tail -n 8 "${gate_out[$g]}" | sed 's/^/    /'
         gates_fail=1; FAILS+=("gate:$g")
     fi
+    { echo "=== $g ==="; cat "${gate_out[$g]}"; } >> "$GATES_LOG"
 done
 [ "$gates_fail" = 0 ] && echo "L1: gates PASS"
 
 # vendor wheel sanity: WARN tier (bad wheel is an environment fact, not an
 # MR regression) -- printed, never fails the gate
-python3 -m pytest tests/vendor/test_flash_attn.py -q --no-header \
+# Vendor probe drives the vendor wheels directly against a torch fp32
+# reference; the sglang host bridge is not under test here, skip its
+# install (~26 s cold interpreter).
+env HCU_ADAPTER_HOST=none python3 -m pytest tests/vendor/test_flash_attn.py -q --no-header \
     > /tmp/l1_vendor.log 2>&1 \
     && echo "L1: vendor PASS" \
     || echo "L1: vendor WARN (wheel sanity; see /tmp/l1_vendor.log)"

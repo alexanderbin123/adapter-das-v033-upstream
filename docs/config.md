@@ -69,6 +69,7 @@ vLLM 0.33/gfx936 的 C4 indexer 候选通过 `ops.vllm_sparse_indexer: native`
 | `rms_norm` | triton（默认）/ aiter / torch | 仅 plain rmsnorm；fused_add/gemma 恒 triton/torch |
 | `allreduce` | aiter（默认）/ nccl | 复合键：aiter=aiter.dist GraphSafe（新镜像压测 4/8-rank 全绿）；nccl=回退；custom 自制 AR 已于 2026-10-19 除役删除（R-01 定罪后 aiter 顶上，修复无意义） |
 | `paged_mqa_logits` | triton（默认，R-13 #4）/ emu（opt-out）/ vendor（broken） | DSA 线 |
+| `minimax_h3_rotary_embedding` | triton / torch（candidate） | H3 DiT128/96及VAE64/48，详见 [H3候选](minimax-h3.md)；BF16分量通过，模型待验证 |
 | `rotary_embedding` | triton（在用，无开关）；aiter / lightop（planned） | rope_fwd / rotary_embedding_fuse 家族待接 |
 | `moe_gate` | triton（在用，contract=torch）；aiter / lightop（planned） | topk_softmax/sigmoid/moe_fused_gate |
 | `fused_moe` | triton（默认回退）/ aiter（validated，auto 先试） | w8a8 专家层：aiter 块量化走 ASM 调优表、通道量化走 moe_c；未调优形状自动回 triton |
@@ -96,3 +97,15 @@ vLLM 0.33/gfx936 的 C4 indexer 候选通过 `ops.vllm_sparse_indexer: native`
 CLI 向导（`tools/hcu_config_wizard.py`）是其命令行形态；`--autotune` 变体=目标机自动探测+实测选档（平台画像→逐算子三门→阶梯降档带理由，见 [autotune.md](autotune.md)）。注意 UI 内嵌的
 目录/配方是代码快照，BACKEND_CATALOG 或 cookbook 变更后需同步（纯函数段
 在文件内 `/*==PURE-BEGIN*/ ... /*==PURE-END*/` 标记之间）。
+
+MiniMax PCP8 prefill 的 Plugin 新能力通过 `ops.vllm_minimax_prefill` 管理：
+默认 `triton`，显式 `stock` 为未融合对照，均保留 candidate 状态。
+Adapter 只提供配置/catalog/快关，数学实现位于独立 `vllm-plugin-das`。
+
+## SGLang sparse MLA 候选后端
+
+`ops.sglang_mla_sparse: dtk` 显式选择 SGLang 专属 BF16 sparse FlashMLA 实现；默认 `emu`，没有新增环境变量。当前原生范围为 BF16、H1–64、D512、top-k 2048–2112（掩码补齐到 64 的倍数）、无 attention sink，其他形状保留兼容路径。实现独立于 vLLM/DeepInfer。候选仅完成小规模数值和变输入 Graph 探针，整模型与性能验收尚未完成。
+
+### MLA HiCache 地址表传输
+
+`hicache_mla_transfer` 当前使用 candidate Triton 实现：按字节处理 device pointer table、pinned host buffer、layer-first/page-first 布局，不将地址值当作缓存数据索引。GPU 路径不读取地址表到 CPU。2026-11-01 定向诊断覆盖 528/8448/33792/65537 字节行、1/7/65 行、三层、双向拷贝与三次变输入 Graph 回放，逐字节一致；完整模型的驱逐回载与性能仍待验收。

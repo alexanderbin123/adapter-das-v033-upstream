@@ -17,8 +17,18 @@ default. Never hard-fail on an unknown value: log and fall back.
 
 import logging
 import os
+import importlib.util
+from pathlib import Path
 
 LOG = logging.getLogger("hcu.adapter")
+def _package_source(package, relative):
+    try:
+        spec = importlib.util.find_spec(package)
+        if spec is None or spec.origin is None:
+            return ""
+        return (Path(spec.origin).parent / relative).read_text(encoding="utf-8")
+    except (ImportError, OSError, ValueError):
+        return ""
 
 
 def arch_name():
@@ -56,14 +66,10 @@ def has_fp8(arch=None):
 def _sglang_uses_new_aiter_ca():
     """True when this sglang build's AR dispatch goes through the NEW
     aiter.dist GraphSafe path (source marker check; no aiter import)."""
-    try:
-        import sglang.srt.distributed.device_communicators.\
-            custom_all_reduce as car
-
-        with open(car.__file__, encoding="utf-8", errors="ignore") as f:
-            return "aiter.dist.device_communicators" in f.read()
-    except Exception:
-        return False
+    source = _package_source(
+        "sglang", "srt/distributed/device_communicators/custom_all_reduce.py"
+    )
+    return "aiter.dist.device_communicators" in source
 
 
 def _auto_aiter_ar():
@@ -86,15 +92,29 @@ def _auto_quant_impl():
         import torch
 
         if getattr(torch.version, "hip", None) is not None:
-            import aiter  # noqa: F401
-
-            return "aiter"
+            if importlib.util.find_spec("aiter") is not None:
+                return "aiter"
     except Exception:
         pass
     return "stock"
 
 
-def _auto_ar_norm_impl():
+def has_aiter_custom_allreduce():
+    """Legacy host layout check without importing GPU communication code."""
+    try:
+        from importlib.util import find_spec
+        from pathlib import Path
+
+        spec = find_spec("aiter")
+        return bool(spec and spec.submodule_search_locations and any(
+            (Path(root) / "dist" / "device_communicators" / "custom_all_reduce.py").is_file()
+            for root in spec.submodule_search_locations
+        ))
+    except (ImportError, OSError, ValueError):
+        return False
+
+
+def _auto_ar_norm_impl(*, check_layout=True):
     # fused AR+RMSNorm rides the SAME aiter GraphSafe communicator the
     # plain AR auto-rule already vets: refuse wherever HCU_AITER_AR
     # refuses (old-aiter graph-corrupting layouts), else aiter on hip.
@@ -103,10 +123,11 @@ def _auto_ar_norm_impl():
 
         if getattr(torch.version, "hip", None) is None:
             return "stock"
-        from aiter.dist.device_communicators.custom_all_reduce import (  # noqa: F401
-            CustomAllreduce,
-        )
     except Exception:
+        return "stock"
+    # SGLang validates the actual communicator after device binding; retain
+    # the wheel-layout gate for hosts without that lifecycle check.
+    if check_layout and not has_aiter_custom_allreduce():
         return "stock"
     if _auto_aiter_ar().startswith("refused"):
         return "stock"
@@ -122,14 +143,61 @@ def _auto_mqa_emu():
 
 
 REGISTRY = {
+    "HCU_VLLM_FLASHMLA_DECODE": {
+        "env": "HCU_VLLM_FLASHMLA_DECODE", "default": "native",
+        "hosts": ("vllm",),
+        "about": "vLLM 0.33 V4.1 packed native decode: default native; explicit stock falls back; startup only; kill switch wins",
+    },
+    "HCU_VLLM_FLASHMLA_PREFILL": {
+        "env": "HCU_VLLM_FLASHMLA_PREFILL", "default": "native",
+        "hosts": ("vllm",),
+        "about": "vLLM 0.33 V4.1 FlashMLA prefill: default native; explicit stock falls back; startup only; kill switch wins",
+    },
+    "HCU_VLLM_FP4_INDEXER_IMPL": {
+        "env": "HCU_VLLM_FP4_INDEXER_IMPL", "default": "lightop",
+        "hosts": ("vllm",),
+        "about": "V41 FP4 indexer. Eligible V4.1 auto caches default to mxfp4 with paired healthy Plugin owners. Explicit fp8 and stock retain FP8 selection",
+    },
+    "HCU_VLLM_FP4_PACKER_IMPL": {
+        "env": "HCU_VLLM_FP4_PACKER_IMPL", "default": "triton",
+        "hosts": ("vllm",),
+        "about": "Plugin-owned E2M1 lowering: stock or triton; startup only; kill vllm_fp4_packer wins",
+    },
+    "HCU_VLLM_DSV41_CHANNEL_FP8_IMPL": {
+        "env": "HCU_VLLM_DSV41_CHANNEL_FP8_IMPL", "default": "native",
+        "hosts": ("vllm",),
+        "about": "vLLM 0.33 V4.1 channel-wise FP8 config registration: native or stock; startup only; kill vllm_dsv41_channel_fp8 wins",
+    },
+    "HCU_VLLM_CT_W4A8_IMPL": {
+        "env": "HCU_VLLM_CT_W4A8_IMPL", "default": "native",
+        "hosts": ("vllm",),
+        "about": "vLLM 0.33 V4.1 CT W4A8 config registration: native or stock; startup only; kill vllm_ct_w4a8 wins",
+    },
+    "HCU_VLLM_PCP_IMPL": {
+        "env": "HCU_VLLM_PCP_IMPL", "default": "stock",
+        "hosts": ("vllm",),
+        "about": "vLLM 0.33 V4.1 PCP attention: stock or native; startup policy, fresh process required to change",
+    },
     "HCU_VLLM_SPARSE_INDEXER_IMPL": {
         "env": "HCU_VLLM_SPARSE_INDEXER_IMPL", "default": "stock",
         "hosts": ("vllm",),
         "about": "vLLM 0.33/gfx936 C4 indexer candidate: stock or native; startup policy, fresh process required to change",
     },
     "HCU_VLLM_MHC_IMPL": {
-        "env": "HCU_VLLM_MHC_IMPL", "default": "stock",
-        "about": "vLLM 0.33/gfx936 mHC candidate: stock or official Torch via public OOT; startup only",    },
+        "env": "HCU_VLLM_MHC_IMPL", "default": "aiter",
+        "hosts": ("vllm",),
+        "about": "vLLM 0.33/gfx936,gfx938 mHC: aiter (default), torch or stock; stock remains the opt-out; startup only",
+    },
+    "HCU_VLLM_MHC_PRE_SPLIT_K": {
+        "env": "HCU_VLLM_MHC_PRE_SPLIT_K", "default": "auto",
+        "hosts": ("vllm",),
+        "about": "vLLM 0.33 aiter mHC staged delayed Pre split-K: auto or 1/2/4/8/16/32; auto=32 only for hc4/hidden5120/0<tokens<=64; startup only",
+    },
+    "VLLM_HCU_USE_AITER_TILELANG_MHC": {
+        "env": "VLLM_HCU_USE_AITER_TILELANG_MHC", "default": "1",
+        "hosts": ("vllm",),
+        "about": "vLLM 0.33 aiter mHC staged delayed-Pre stage2: use TileLang pre_big_fuse_tilelang by default; explicit 0 selects legacy AITER big_fuse; unavailable TileLang falls back to official Torch; startup only",
+    },
     "HCU_CONFIG": {"env": "HCU_CONFIG", "default": "", "about": "Deployment configuration path; shared across hosts"},
     "HCU_WORKER_CONTEXT": {"env": "HCU_WORKER_CONTEXT", "default": "", "about": "DeepInfer inherited worker context; internal", "hosts": ("deepinfer",)},
     "HCU_BF16_TFLOPS": {"env": "HCU_BF16_TFLOPS", "default": "0", "about": "DeepInfer optional MFU calibration", "hosts": ("deepinfer",)},
@@ -159,7 +227,7 @@ REGISTRY = {
     # kill switches (triage; see kill_switch.py) — explicit-only by nature
     "HCU_DISABLE_OPS": {
         "env": "HCU_DISABLE_OPS", "default": "",
-        "about": "快关总闸：逗号分隔禁用高危算子（aiter_ar,aiter_fa）",
+        "about": "快关总闸：逗号分隔禁用高危算子（aiter_ar,aiter_fa,vendor_fa；后者在新进程回 triton）",
     },
     # runtime dump — path for JSON (<summary>/1 = log a dict, debug tier)
     "HCU_ADAPTER_DUMP": {
@@ -246,6 +314,24 @@ REGISTRY = {
                  "关融合不是绕法（mapper 后的组 targets 只认融合名）；"
                  "=0 跳过安装。",
     },
+    "HCU_FLASHMLA_SPARSE_CHUNK_MB": {
+        "env": "HCU_FLASHMLA_SPARSE_CHUNK_MB", "default": "512",
+        "about": "sparse FlashMLA emu（sgl_kernel/flash_mla_sparse.py）按 s_q "
+                 "分块的 fp32 工作集预算（MiB）：整块 gather+scores 在 8k "
+                 "prefill chunk 上要 34 GiB 并在 prefill graph 捕获期 OOM"
+                 "（S1 Hy4 2026-11-03）；行间独立，分块数值不变",
+    },
+    "HCU_HYV4_CT_SCALE": {
+        "env": "HCU_HYV4_CT_SCALE", "default": "1",
+        "about": "HYV4 CT-int8 scale 命名运行时兼容（hyv4_ct_scale_patch.py）："
+                 "v0522 hunyuan_v4(_nextn).py load_weights 无条件把 .weight_"
+                 "scale 改名 .weight_scale_inv（fp8 block 命名），CT W8A8Int8/"
+                 "WNA16 参数叫 .weight_scale → Hy4 Channel-INT4-w4a8 加载期 "
+                 "KeyError(shared_experts.gate_up_proj.weight_scale_inv，S1 "
+                 "2026-11-03)。HYV4 类内 do_load_weights 包装：模型无 *_inv "
+                 "参数时去掉社区追加的 _inv 再交原 mixin；不读写社区源码。"
+                 "上游各平台同病；=0 跳过安装",
+    },
     # custom all-reduce
     "HCU_AITER_AR": {
         "env": "HCU_AITER_AR", "default": "0",
@@ -267,6 +353,10 @@ REGISTRY = {
         "env": "VLLM_ROCM_USE_AITER_CUSTOM_AR", "default": "1", "hosts": ("vllm",),
         "about": "Official AR child switch; 0 vetoes HCU_AITER_AR opt-in, without enabling global AITER",
     },
+    "VLLM_MOE_SKIP_PADDING": {
+        "env": "VLLM_MOE_SKIP_PADDING", "default": "1", "hosts": ("vllm",),
+        "about": "Official skip sentinel; HCU unquantized AITER normalizes to 0 before workers spawn",
+    },
     "AITER_AR_MAX_SIZE_MB": {
         "env": "AITER_AR_MAX_SIZE_MB", "default": "64", "hosts": ("vllm",),
         "about": "Existing provider ordinary-AR admission MiB; staging >=128 MiB and >=2x admission",
@@ -287,19 +377,24 @@ REGISTRY = {
         "env": "HCU_QUANT_IMPL", "default": "auto",
         "auto": _auto_quant_impl,
         "about": "per-token fp8 量化族 vendor 档（R-09③，quant_aiter 桥）："
-                 "auto=hip+aiter 轮可导入则 aiter（sglang_per_token_quant_"
-                 "fp8 在 HIP 本就 NameError=行为还原；group plain 臂尺度与"
-                 "金标准逐位一致+q RTN 命中 99.8%，15.1×）；aiter=显式；"
-                 "stock=退回上游原生（triton raw group + torch scaled "
-                 "natives）。异形臂（column_major/tma/ue8m0/masked/非 "
-                 "e4m3/3D）恒走上游；aiter 失败 log-once 回退",
+                 "档位序 lightop > aiter > stock；auto=hip+aiter 轮可导入则 "
+                 "aiter（sglang_per_token_quant_fp8 在 HIP 本就 NameError="
+                 "行为还原；group plain 臂尺度与金标准逐位一致+q RTN 命中 "
+                 "99.8%，15.1×）；lightop=显式档（catalog planned，门禁未过"
+                 "不自动；装好后 rowwise/group/fused 臂先试 lightop）；"
+                 "aiter=显式；stock=退回上游原生（triton raw group + torch "
+                 "scaled natives）。异形臂（column_major/tma/ue8m0/masked/非 "
+                 "e4m3/3D）恒走上游；vendor 失败 log-once 回退",
     },
     "HCU_AR_NORM_IMPL": {
         "env": "HCU_AR_NORM_IMPL", "default": "auto",
         "auto": _auto_ar_norm_impl, "auto_hosts": ("sglang", "vllm"),
+        "auto_by_host": {"sglang": lambda: _auto_ar_norm_impl(check_layout=False)},
         "about": "融合 AR+RMSNorm vendor 档（R-09①，ar_norm_aiter 桥）："
-                 "auto=hip+aiter GraphSafe 类可导入且 HCU_AITER_AR auto 规"
-                 "则未拒（旧布局图重放损坏史连带拒融合）则 aiter——对 "
+                 "auto=hip 且 HCU_AITER_AR auto 规则未拒时选 aiter 候选；"
+                 "SGLang 不检查模块文件，设备绑定和 TP 通信初始化后"
+                 "检查真实通信对象再安装融合；vLLM 保留模块文件检查；"
+                 "旧布局图重放损坏史连带拒融合。对 "
                  "fp64 精确 AR 真值 norm 1ulp/residual 0ulp（优于 rccl "
                  "3-8ulp），vs customAR+norm 1.38-2.11×（hidden=4096 "
                  "t=1..4096），图回放新鲜数据精确；仅全 TP 组目标融合"
@@ -351,8 +446,11 @@ REGISTRY = {
                  "四件套。=0 关闭（回归对照），=数字改阈值",
     },
     "HCU_MQA_LOGITS_IMPL": {
-        "env": "HCU_MQA_LOGITS_IMPL", "default": "triton",
-        "about": "DSA indexer paged-MQA 实现档：vec=全窗口单遍双 bmm"
+        "env": "HCU_MQA_LOGITS_IMPL", "default": "auto",
+        "about": "DSA indexer paged-MQA 实现档：auto=triton（lightop 门禁"
+                 "未过=catalog planned，仅显式 =lightop 可 A/B；aiter 轮无 "
+                 "paged API=planned；deepgemm=vendor 轮有符号钳零 bug=broken，"
+                 "均不进 auto）。vec=全窗口单遍双 bmm"
                  "（大操作数免转置物化）——decode 图节点 23.9k→3.7k（-84%），"
                  "hipGraphLaunch API p50 540ms→21.6ms，单流 2.3→3.50 tok/s、"
                  "bs8 14.0→18.69；注意 (N,T,D) 转置物化/整窗 fp32 物化在 DTK "
@@ -410,7 +508,9 @@ REGISTRY = {
                  "triton 核（paged_attn_triton.py / fa_varlen_triton.py，"
                  "契约超界面回 emu）|vendor=decode/verify 短窗走 DTK "
                  "flash_attn wheel（gfx936 wheel paged 短窗存在词汤级数值"
-                 "问题，2026-10-12 bw7 实测，待 DTK 修）|emu=恒 torch 模拟。"
+                 "问题，2026-10-12 bw7 实测，待 DTK 修；非分页 BF16/FP16 "
+                 "dense/packed 桥保持 FA3 输出契约，HCU_DISABLE_OPS=vendor_fa "
+                 "在新进程回 triton，见 docs/dense-flashattention.md）|emu=恒 torch 模拟。"
                  "**2026-10-19 serving A/B（glm53f tp4）**：≤8k ctx 质量+"
                  "性能平价（锚点/解码 8.27 tok/s 完全一致/prefill ±10%）；"
                  "首 boot 揪出 ops 重绑丢 q_v 面包参（only_qv+qv→emu 断言"
@@ -424,9 +524,18 @@ REGISTRY = {
     },
     "HCU_LINEAR_ATTN_GDN": {
         "env": "HCU_LINEAR_ATTN_GDN", "default": "auto",
-        "about": "GDN/gated-delta-rule 线性注意力档位：auto|triton=上游 triton "
-                 "fla（现状默认）；aiter=aiter CK 核路由（fwd_h 状态递推 + "
-                 "packed decode；K=V=128，state pool gather/scatter）",
+        "about": "GDN/gated-delta-rule 线性注意力档位：auto=aiter > triton"
+                 "（新优先级：aiter CK 已验证 6/6 + Qwen3.5-27B e2e；不可导入"
+                 "或安装失败时回上游 triton）；triton=强制上游 fla；"
+                 "aiter=显式 CK 路由（fwd_h 状态递推 + packed decode；"
+                 "K=V=128，state pool gather/scatter）",
+    },
+    "HCU_LINEAR_ATTN_GDN_VERIFY": {
+        "env": "HCU_LINEAR_ATTN_GDN_VERIFY", "default": "auto",
+        "about": "GDN target_verify: auto=qualified gfx936/DTK2610 build and packed "
+                 "BF16 H8/HV24 N<=18/draft4 with FP32 state/snapshots -> AITER; "
+                 "others upstream. triton=upstream rollback, aiter=manual provider. "
+                 "Independent of prefill/packed decode; startup/capture policy",
     },
     "HCU_DSA_PRESHUFFLE": {
         "env": "HCU_DSA_PRESHUFFLE", "default": "1",
@@ -444,23 +553,27 @@ REGISTRY = {
     # vendor op backends (替换矩阵档位: auto|triton|lightop|torch)
     "HCU_SILU_MUL_IMPL": {
         "env": "HCU_SILU_MUL_IMPL", "default": "auto",
-        "about": "silu_and_mul 后端档位：auto=triton（lightop 过验证后转正），"
-                 "triton|lightop|torch",
+        "about": "silu_and_mul 后端档位：auto=lightop > aiter > triton"
+                 "（新优先级；JIT 不走——PR #96 的 33s 冷编译），"
+                 "lightop|aiter|triton|torch 可显式指定；aiter 仅当真轮"
+                 "导出 silu_and_mul（适配器 stub 会被探针跳过）",
     },
     "HCU_RMS_NORM_IMPL": {
-        "env": "HCU_RMS_NORM_IMPL", "default": "triton",
-        "about": "rms_norm 后端档位：triton|aiter(rmsnorm_forward 桥)|lightop|torch；"
-                 "lightop 仅覆盖 BF16 plain RMSNorm，其他 dtype 使用 triton；"
-                 "仅管 plain rmsnorm，fused_add/gemma 变体见 "
-                 "HCU_FUSED_ADD_RMS_IMPL",
+        "env": "HCU_RMS_NORM_IMPL", "default": "auto",
+        "about": "rms_norm 后端档位：auto=lightop > aiter > triton"
+                 "（新优先级）；lightop|aiter|triton|torch 可显式指定。"
+                 "lightop 仅覆盖 BF16 plain RMSNorm，其他 dtype 逐级回退 "
+                 "aiter/triton；gemma 变体恒 triton；仅管 plain rmsnorm，"
+                 "fused_add 变体见 HCU_FUSED_ADD_RMS_IMPL",
     },
     "HCU_FUSED_ADD_RMS_IMPL": {
         "env": "HCU_FUSED_ADD_RMS_IMPL", "default": "auto",
-        "about": "fused_add_rmsnorm/gemma 变体后端档位：auto=triton（lightop "
-                 "过验证后转正），triton|lightop|torch；lightop="
-                 "lightop.fused_add_rms_norm/gemma_fused_add_rmsnorm 原地核"
-                 "（fp32 累加、末端舍入，同 triton 数值契约；一次异常即降级 "
-                 "triton）",
+        "about": "fused_add_rmsnorm/gemma 变体后端档位：auto=lightop > "
+                 "triton（新优先级；aiter 轮无 fused-add 出口），"
+                 "lightop|triton|torch 可显式指定；lightop=lightop.fused_add_rms_norm/"
+                 "gemma_fused_add_rmsnorm 原地核（fp32 累加、末端舍入，同 "
+                 "triton 数值契约；一次异常即降级）。注：catalog 记录 lightop "
+                 "0.76x vs triton @4096x7168 bf16（性能取舍由本优先级覆盖）",
     },
     "HCU_FUSED_MOE_IMPL": {
         "env": "HCU_FUSED_MOE_IMPL", "default": "auto",
@@ -584,12 +697,12 @@ REGISTRY = {
                  "默认=0 直通 triton；留作内核回归 watch",
     },
     "HCU_KPOOL_READ_EMU": {
-        "env": "HCU_KPOOL_READ_EMU", "default": "1",
-        "about": "index-K 缓存 gather 读（GetKAndS.aiter → aiter "
-                 "cp_gather_indexer_k_quant_cache preshuffle 臂）走 torch emu："
-                 "该 aiter 内核在 gfx938 非法地址访问/返回零（定罪 probe GPU4）"
-                 "→ prefill topk score 全零 → 词汤。emu 用与写侧同一 16-tile "
-                 "映射解排（CPU/GPU roundtrip 全等）。=0 退回 aiter 内核",
+        "env": "HCU_KPOOL_READ_EMU", "default": "0",
+        "about": "index-K 缓存 gather 读（GetKAndS.aiter）档位：默认=0 走"
+                 "新增的 preshuffle-aware triton gather（kpool_read_triton.py；"
+                 "与写侧同一 16-tile 映射解排，替代 gfx938 上非法地址/返回零的 "
+                 "aiter cp_gather_indexer_k_quant_cache）；=1 显式退回 torch emu"
+                 "（bit 级对照/回退）。非 gfx93 平台仍可走上游 aiter 内核",
     },
     "HCU_MHC_EMU": {
         "env": "HCU_MHC_EMU", "default": "0",

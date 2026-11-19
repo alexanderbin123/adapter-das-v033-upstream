@@ -38,6 +38,7 @@ def _note_call(tag):
 
 
 def _fp8_view_dtype():
+    # 替代档: 无（fp8 dtype probe helper；包面未导出 is_fp8_fnuz）
     from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
     return torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
@@ -92,7 +93,7 @@ def _paged_mqa_logits(
             kg = k_b[pt]  # [Qq, Tt, D]
             sc = k_scale[pt].unsqueeze(1)  # [Qq, 1, Tt]
             scores = torch.matmul(qb, kg.transpose(1, 2)).float()  # [Qq, H, Tt]
-            row = (scores * w[i0:i1].unsqueeze(-1) * sc).sum(dim=1)  # [Qq, Tt]
+            row = (scores.relu() * w[i0:i1].unsqueeze(-1) * sc).sum(dim=1)  # [Qq, Tt]
             valid = ar[: t1 - t0].unsqueeze(0) + t0 < seq[i0:i1].unsqueeze(1)
             logits[i0:i1, t0:t1] = torch.where(valid, row, 0.0)
     return logits
@@ -125,7 +126,7 @@ def _ragged_fp8_mqa_logits(
             kt = k_b[t0:t1].transpose(0, 1)  # [D, Tt]
             scores = torch.matmul(qb, kt.unsqueeze(0))  # [Qq, H, Tt]
             sc = k_scale[t0:t1]
-            row = (scores.float() * sc.view(1, 1, -1) * w[i0:i1].unsqueeze(-1)).sum(
+            row = (scores.float().relu() * sc.view(1, 1, -1) * w[i0:i1].unsqueeze(-1)).sum(
                 dim=1
             )
             valid = (ar[: t1 - t0].unsqueeze(0) + t0 >= ks[i0:i1].unsqueeze(1)) & (
@@ -186,6 +187,7 @@ def _triton_or_emu_faces():
 
 
 def install():
+    # 替代档: dsa 包挂载面（aiter_paged_mqa_logits 分档见 HCU_MQA_LOGITS_IMPL）
     import sglang.kernels.ops.attention.dsa as _dsa_pkg
 
     _paged_fn, _ragged_fn, _impl_label = _triton_or_emu_faces()

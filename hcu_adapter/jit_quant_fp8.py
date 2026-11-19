@@ -47,6 +47,53 @@ _PATCHES = (
     ("gemm/per_token_group_quant.cuh", _NEEDLE_QUANT, _REPL_QUANT),
 )
 
+# Under HIP fp8_e4m3_t is uint8 storage, so the community static_cast would
+# truncate a numeric value into a byte instead of encoding an OCP FP8 value.
+# Apply to both the CTA and warp kernels in the private compiler-input bundle.
+_NEEDLE_TOKEN_CVT = (
+    "output_vec[j] = static_cast<fp8_e4m3_t>("
+    "math::max(math::min(value, math::FP8_E4M3_MAX), -math::FP8_E4M3_MAX));"
+)
+_REPL_TOKEN_CVT = (
+    "output_vec[j] = __hip_cvt_float_to_fp8("
+    "math::max(math::min(value, 448.0f), -448.0f), "
+    "__HIP_SATFINITE, __HIP_E4M3);"
+)
+_PATCHES += (("gemm/per_token_quant_fp8.cuh", _NEEDLE_TOKEN_CVT, _REPL_TOKEN_CVT),)
+# This export writes OCP e4m3fn, not the architecture-default FNUZ format.
+# Match its scale divisor to the explicit OCP conversion without changing the
+# shared math constant used by other, independently validated kernel families.
+_NEEDLE_TOKEN_SCALE = " / math::FP8_E4M3_MAX"
+_REPL_TOKEN_SCALE = " / 448.0f"
+_PATCHES += (("gemm/per_token_quant_fp8.cuh", _NEEDLE_TOKEN_SCALE, _REPL_TOKEN_SCALE),)
+_NEEDLE_TOKEN_INCLUDE = "#include <sgl_kernel/tensor.h>"
+_REPL_TOKEN_INCLUDE = "#include <hip/hip_runtime.h>\n#include <hip/hip_fp8.h>\n" + _NEEDLE_TOKEN_INCLUDE
+_PATCHES += (("gemm/per_token_quant_fp8.cuh", _NEEDLE_TOKEN_INCLUDE, _REPL_TOKEN_INCLUDE),)
+
+# The per-tensor kernel only needs atomic::max. Its shared atomic header also
+# declares unused CUDA PTX event helpers, which HIP rejects even without calls.
+# Keep the existing HIP CAS maximum, local to this compiler input only.
+_TENSOR_ATOMIC = """#include <sgl_kernel/utils.cuh>
+namespace sglang::device::atomic {
+SGL_DEVICE float max(float* addr, float value) {
+  int* bits = reinterpret_cast<int*>(addr);
+  int old = *bits, assumed;
+  do {
+    assumed = old;
+    old = atomicCAS(bits, assumed, __float_as_int(fmaxf(value, __int_as_float(assumed))));
+  } while (assumed != old);
+  return __int_as_float(old);
+}
+}
+"""
+_PATCHES += (
+    ("gemm/per_tensor_quant_fp8.cuh", _NEEDLE_TOKEN_INCLUDE, _REPL_TOKEN_INCLUDE),
+    ("gemm/per_tensor_quant_fp8.cuh", "#include <sgl_kernel/atomic.cuh>", _TENSOR_ATOMIC),
+    ("gemm/per_tensor_quant_fp8.cuh", "static_cast<DST_DTYPE>(value)",
+     "__hip_cvt_float_to_fp8(value, __HIP_SATFINITE, __HIP_E4M3)"),
+    ("gemm/per_tensor_quant_fp8.cuh", "math::FP8_E4M3_MAX", "448.0f"),
+)
+
 # v0.5.22 added a second-generation kernel file whose fp8 store path calls
 # the CUDA conversion family by its __nv spelling (per_token_group_quant_
 # 8bit_v2.cuh:325/332 — gfx938 hipcc: unknown type name
@@ -61,6 +108,25 @@ _REPL_V2_CVT = "__hip_cvt_float2_to_fp8x2(outputx2, __HIP_SATFINITE, __HIP_E4M3)
 _PATCHES_V2 = (
     ("gemm/per_token_group_quant_8bit_v2.cuh", _NEEDLE_V2_PACKED, _REPL_V2_PACKED),
     ("gemm/per_token_group_quant_8bit_v2.cuh", _NEEDLE_V2_CVT, _REPL_V2_CVT),
+)
+
+# v0.5.23's quant rework added a bf16+fp8 fast path in run_packed16 that
+# brace-constructs the packed fp8 pair straight from float2:
+#   out[i] = Q2{scaled};
+# Under USE_ROCM fp8x2_e4m3_t is raw uint16_t storage (utils.cuh) with no
+# float2 constructor — gfx936 hipcc dies with "no viable conversion from
+# 'const float2' to 'Q2'" the first time the v0.5.23 call sites instantiate
+# the bf16/u8 family (group-quant bridge + fp8 quantized-linear chains,
+# 2026-11-15 bw47 forensics). Route it through the same DTK SATFINITE
+# conversion the generic branch already uses, but WITHOUT WeightTrait's
+# +-448 pre-clamp: v0.5.23's bf16 semantics deliberately keep NaN observable
+# (see the trait comment in-place); __HIP_SATFINITE saturates infinities and
+# out-of-range finites on both stacks, so unclamped conversion is the
+# bit-faithful equivalent of CUDA's Q2{scaled}.
+_NEEDLE_BF16_FAST = "out[i] = Q2{scaled};"
+_REPL_BF16_FAST = (
+    "out[i] = (Q2)__hip_cvt_float2_to_fp8x2(scaled, __HIP_SATFINITE, __HIP_E4M3);"
+    "  // HCU: raw-uint16 fp8x2 has no float2 ctor; unclamped SATFINITE == CUDA brace-init"
 )
 
 # The community DSV4 software converter saturates exp8 >= 15, collapsing
@@ -138,6 +204,28 @@ def _apply(root, register):
         raise RuntimeError("jit_quant_fp8: upstream needles changed: " + ",".join(missing))
 
     import hcu_adapter.registry as _reg
+
+    # v0.5.23+ only: the bf16 packed fast-path store (see _NEEDLE_BF16_FAST).
+    # Pre-v0.5.23 trees legitimately lack the path, so tolerate absence (one
+    # transform bundle serves both lines) and register only when the patch is
+    # actually live on this tree.
+    _p_fast = csrc / "gemm/per_token_group_quant.cuh"
+    _text_fast = _p_fast.read_text(encoding="utf-8")
+    if _REPL_BF16_FAST in _text_fast:
+        pass  # already applied (re-run over a patched staging copy)
+    elif _NEEDLE_BF16_FAST in _text_fast:
+        from hcu_adapter.atomic_io import atomic_write
+
+        atomic_write(_p_fast, _text_fast.replace(_NEEDLE_BF16_FAST, _REPL_BF16_FAST))
+        register(
+            "per_token_quant",
+            "gfx936-hipcc-fp8-cvt",
+            target="text:sglang/kernels/jit/csrc/gemm/per_token_group_quant.cuh",
+            mechanism=_reg.MECH_TEXT,
+            detail=_NEEDLE_BF16_FAST,
+        )
+    else:
+        LOG.info("jit_quant_fp8: bf16 packed fast path absent (pre-v0.5.23 cuh)")
 
     # TEXT_PATCH_ALLOWLIST keys are (op, exact needle); the registry gate
     # fingerprints a text patch by its detail, so each needle registers as

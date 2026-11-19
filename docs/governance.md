@@ -174,7 +174,7 @@ sglang 符号面，shim 妥协不进契约。
 1. **具体实现文件 = `<op>[_<变体>]_<tier>`**，tier 词表封闭：
    `emu`（torch 直算/仿真臂）· `triton`（自研 triton）· `cpp`（C++ JIT）·
    `fork`（vendor 源码 fork 承接）· `ref`（诊断参照，位置约束见 §2）；
-   vendor 库绑定安装器用**库名**：`aiter` / `lightop` / `dtk` / `rccl`（通信库）。
+   vendor 库绑定安装器用**库名**：`aiter` / `lightop` / `boltops` / `dtk` / `rccl`（通信库）。
    例：`conv1d_update_emu` · `mqa_logits_triton` · `paged_attn_cpp` ·
    `quant_aiter` · `deep_gemm_dtk`。**平台词（hip/cuda/rocm）不算档位**，
    禁作实现后缀。
@@ -192,12 +192,14 @@ sglang 符号面，shim 妥协不进契约。
    （elementwise / moe / gemm_fp8 …）；包内自研 helper 同样适用本规范
    （`paged_attn_triton` / `paged_attn_cpp` / `fa_varlen_triton`）。
 
-6. **DeepInfer 内核门面与机制豁免清单**（与 L0 同步）：
+6. **内核门面与机制豁免清单**（与 L0 同步）：
    - `gemm.py`、`gather.py`、`norm.py`、`index_ops.py`：校验或选择后端的门面。
    - `fused_transform.py`：按原有顺序组织 norm/RoPE/量化、输出写回和缓存写入的复合执行门面；
      单档位 RoPE 与 KV 计算分别位于 `rope_{emu,lightop}`、`kv_cache_emu`。
    - `runtime_config.py`：宿主侧配置、对齐规则及运行参数状态，无张量数值实现。
    - `lightop_usage.py`：共享调用计数机制，无张量数值实现。
+   - `pcp_dspark.py`：组织 vLLM V4.1 PCP 推测解码的压缩历史、环形槽位元数据与回滚；
+     复用 Core 的压缩和注意力实现。
    L0 对 `hcu_adapter/kernels/` 按此清单或档位后缀检查；新增豁免需同步说明职责。
 7. **实现文件档位与配置值分开管理**：`_emu` 是 Torch/仿真实现的文件后缀；
    已发布的后端选择值 `torch` 仍是合法配置值，不是文件命名档位。
@@ -262,7 +264,11 @@ sglang 符号面，shim 妥协不进契约。
   实验性但确有价值的材料须先清理到自洽（锚点/文件名与事实一致、附
   状态说明 README、已验证部分能跑通）再入库，否则留在工作区或特性
   分支不进库。首个应用：`tools/sgl_kernel_hcu/`（七轮修复自洽成册，
-  构建产物不入库）。
+  构建产物不入库）；
+- **Agent 提交的 MR 一律 draft 起步**（2026-11-11 定，两仓一致）：凡由
+  Agent（AI 协作者）发起的 MR，默认以 Draft 状态创建；人工审核确认
+  没问题后，由 Agent 或人工将其改为 Open（Ready for review）才进入
+  合入流程——draft 期间视为"未经人工背书的提案"。生效首个应用：#80。
 
 历史豁免：本节生效前已合入的 merge commit 不追改；生效首个观察点是
 #27/#26。
@@ -482,8 +488,27 @@ Adapter 不保存 Plugin backend 路径，正式 registry 发布与健康检查�
 
 ### 7.4 版本与门（宿主 / 影子包）
 
-- 影子包 `sgl-kernel` 的版本号必须携带上游基线（目标形态 `0.5.22+hcu.N`）；
-  现值 `0.1.0` 待改——不带基线信息时 pip 层与官方 wheel 可互替、静默换内核；
+- **影子 dist 版本账已销**（2026-11-09 解耦双 dist 落地）：两包版本线**各自独立**——
+  `sgl-kernel` = 纯影子内核（**main 不定基线**：携带 `0.0.0+hcu.dev0`，**拉出 release
+  分支时定死**，基线跟配对上游**内核线**——例 release/sglang_v0.5.22 已定 `0.4.9+hcu.1`：
+  v0.5.22 树的 `python/sglang/kernels/aot`、依赖 pin 与 engine.py 探针三处一致为
+  0.4.9；单源 `sgl_kernel/version.py`，重配对上游树时基线跟那棵树的 aot 版本走）；
+  `hcu-adapter` = 适配层（`hcu_adapter/` + sitecustomize + vllm entry-points；初始
+  `0.5.22+hcu.1`，编码本线 sglang 配对；单源 `packaging/hcu-adapter/VERSION`）。
+  互锁：hcu-adapter 依赖 `sgl-kernel==<内核公共版本>[+<平台标签>[.<戳>]]` 精确等号，
+  禁止 `>=`/`~`。构建期由 `packaging/hcu-adapter/_pin.py` 从单一版本源渲染 pin：
+  `packaging/build.sh` 用 setup_hip.py 编译 native 内核，并把同一个
+  `DAS_PLATFORM_TAG=dtk<DTK>.torch<TORCH>`（native 扩展的 ABI 标签）和
+  `DAS_BUILD_STAMP=<时间>.g<commit>` 传给两张 wheel（渲染为
+  `+dtk<DTK>.torch<TORCH>.<时间>.g<commit>`），内核与 adapter 依赖逐字互锁；
+  无戳时平台标签仍保留（精确等号），只有直接 `pip wheel` 的纯 python 变体
+  （测试/开发）才退回 `+hcu.<戳>` 或内核公共版本等号。
+  `ci/l0_gate.py` 与 `packaging/build.sh` 双重校验。当初评估解耦的结论：单
+  wheel 让"双宿主适配层挂单宿主内核名"，拆分后 sgl-kernel 的用法与语义与上游
+  内核包对齐（独立内核包，谁需要谁装）；**复评触发条件**：官方
+  sgl-kernel/sglang-kernel 依赖关系弱化（pip 层可被我们的影子直接替代）时重评
+  是否回归单 dist。半装防护：`sgl_kernel/__init__` 哨兵——环境无 `hcu_adapter`
+  时 import 期即 raise（防止"只装 sgl-kernel 不装 hcu-adapter"的半失效静默）；
 - vLLM 支持门现钉 v0.32.0 release line（`bridges/vllm.py`）；抽 common 时
   sglang 线同享"不支持在选择前 fail"；
 - **已知悬案**：vLLM platform plugin 在本栈 import order 下挂死（validation-host-26

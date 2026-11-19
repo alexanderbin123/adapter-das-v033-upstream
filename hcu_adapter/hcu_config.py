@@ -15,11 +15,14 @@ Schema (hcu_adapter.yaml, first hit wins in discovery order):
 
     version: 1
     ops:
-      silu_and_mul: triton      # triton | lightop | torch
-      rms_norm: aiter           # triton | aiter | lightop | torch
-      fused_add_rms_norm: triton  # triton | lightop | torch
+      # unset/auto = lightop > aiter > jit > triton (silu and the norm
+      # family run lightop > aiter > triton; the sglang activation JIT is
+      # excluded, 33-49 s cold ninja build)
+      silu_and_mul: lightop     # lightop | aiter | triton | torch
+      rms_norm: lightop         # lightop | aiter | triton | torch
+      fused_add_rms_norm: lightop  # lightop | triton | torch
       allreduce: aiter          # aiter | nccl (custom AR retired 2026-10-19)
-      paged_mqa_logits: triton   # triton (DEFAULT, R-13 #4) | emu | vendor
+      paged_mqa_logits: triton   # triton (auto landing, R-13 #4) | emu | vendor
 
 Discovery: $HCU_CONFIG > ./hcu_adapter.{yaml,yml,json} >
 <adapter root>/hcu_adapter.{yaml,yml,json}. No file -> pure legacy
@@ -59,6 +62,14 @@ class HcuConfigError(RuntimeError):
 # backends   selectable backend -> {status, note}
 
 BACKEND_CATALOG = {
+    "vllm_inverse_rope": {
+        "var": None,
+        "summary": "Plugin HCU inverse GPT-J RoPE on V41 PCP BF16 attention output",
+        "backends": {
+            "stock": {"status": "candidate", "note": "Default: original Core inverse RoPE"},
+            "hcu": {"status": "candidate", "note": "Packaged native kernel compiled before model construction; 64-dimension tail; device/Graph/model gates pending"},
+        },
+    },
     "cuda_graph": {
         "var": None,
         "summary": "HIP driver guard for breakable prefill graph capture",
@@ -73,6 +84,113 @@ BACKEND_CATALOG = {
             },
         },
     },
+    "vllm_flashmla_decode": {
+        "var": "HCU_VLLM_FLASHMLA_DECODE",
+        "summary": "vLLM 0.33 V4.1 native packed-FP8 sparse decode without BF16 KV gather",
+        "backends": {
+            "stock": {"status": "candidate", "note": "Explicit stock fallback: original decode global, metadata and backend selection"},
+            "native": {"status": "candidate", "note": "Default gfx938 D512 OCP 584-byte cache; fresh per-call native plan; original MXFP8 epilogue; GPU/Graph/model/performance pending"},
+        },
+    },
+    "vllm_flashmla_prefill": {
+        "var": "HCU_VLLM_FLASHMLA_PREFILL",
+        "summary": "vLLM 0.33 V4.1 gathered-BF16 sparse prefill via native FlashMLA",
+        "backends": {
+            "stock": {"status": "candidate", "note": "Explicit stock fallback: unchanged official ROCm dispatch"},
+            "native": {"status": "candidate", "note": "Default gfx936/gfx938 D512 BF16 dense-index prefill; DTK FlashMLA, no FP32 API; device/model/performance gates pending"},
+        },
+    },
+    "vllm_fp4_indexer": {
+        "var": "HCU_VLLM_FP4_INDEXER_IMPL",
+        "summary": "V41 LightOp FP4 indexer with variable allocator pages",
+        "backends": {
+            "stock": {"status": "candidate", "note": "Explicit stock fallback: existing FP8 behavior"},
+            "lightop": {"status": "candidate", "note": "Eligible V4.1 auto defaults to MXFP4 when the indexer and packer Plugin owners are healthy. Explicit FP8 and stock remain selectable. PCP1 eager/PIECEWISE and constrained eager PCP8 TP1/DP1/EP/HT without speculation; bounded query scores and transient profile budget with ratio-specific decode staging; rebased model validation pending"},
+        },
+    },
+    "vllm_fp4_packer": {
+        "var": "HCU_VLLM_FP4_PACKER_IMPL",
+        "summary": "Plugin-owned vLLM 0.33 E2M1 arithmetic lowering",
+        "backends": {
+            "stock": {"status": "candidate", "note": "Explicit stock fallback: audited upstream bindings; no lowering installed"},
+            "triton": {"status": "candidate", "note": "Default: gfx938 Plugin packer; CPU contracts only; native, Graph and model gates pending"},
+        },
+    },
+    "vllm_dsv41_channel_fp8": {
+        "var": "HCU_VLLM_DSV41_CHANNEL_FP8_IMPL",
+        "summary": "vLLM 0.33 V4.1 channel-wise FP8 config via the public quantization API",
+        "backends": {
+            "stock": {"status": "candidate", "note": "Do not register the distinct config; upstream FP8/CT selection is untouched"},
+            "native": {"status": "candidate", "note": "Register hcu_dsv41_channel_fp8 without replacing FP8/CT/oracle owners; checkpoint loading and GPU gates pending"},
+        },
+    },
+    "vllm_ct_w4a8": {
+        "var": "HCU_VLLM_CT_W4A8_IMPL",
+        "summary": "vLLM 0.33 V4.1 compressed-tensors W4A8 config via the public quantization API",
+        "backends": {
+            "stock": {"status": "candidate", "note": "Do not register the distinct config; native CT remains the owner"},
+            "native": {"status": "candidate", "note": "Register hcu_dsv41_ct_w4a8; HCU MoE execution stays plugin-private; model/GPU gates pending"},
+        },
+    },
+    "vllm_pcp": {
+        "var": "HCU_VLLM_PCP_IMPL",
+        "summary": "vLLM 0.33 V4.1 PCP attention owned by the adapter kernel module",
+        "backends": {
+            "stock": {"status": "candidate", "note": "Default: adapter builds no PCP classes; the plugin keeps its native path"},
+            "native": {"status": "candidate", "note": "Adapter-owned V41 PCP backends/indexer/attention; plugin injects the FP8 reference scorer and publishes the model; eager PCP2+ only, real-device gates pending"},
+        },
+    },
+    "vllm_pcp_q_rope": {
+        "var": None,
+        "summary": "vLLM V4.1 PCP prefill Q-only RoPE",
+        "backends": {
+            "stock": {"status": "candidate", "note": "Default: upstream fused query preparation"},
+            "hcu": {"status": "candidate", "note": "Opt-in eager gfx938 PCP prefill, in-place GPT-J RoPE; GPU validation pending"},
+        },
+    },
+    "vllm_dsv41_pcp_compat": {
+        "var": None,
+        "summary": "vLLM V4.1 compatibility for the opt-in PCP extension",
+        "backends": {"scoped": {"status": "candidate",
+            "note": "FP8 SHUFFLE scoring, delayed mHC and empty CT linear on the owned eager model."}},
+    },
+
+    "mamba_state_scatter": {
+        "var": None,
+        "summary": "SGLang Mamba verify-state copy launch geometry",
+        "backends": {
+            "triton": {
+                "status": "candidate",
+                "note": "gfx936/gfx938 FP32 entries >=1024: flatten request/block grid, "
+                        "retain source-row mapping and upstream validation. "
+                        "gfx938 bitwise/Graph/spawn and TP2 MTP checked; see docs for scope. "
+                        "Other contracts keep stock. Startup fallback: "
+                        "HCU_DISABLE_OPS=mamba_state_scatter.",
+            },
+        },
+    },
+
+    "qsa_prefill": {
+        "var": None, "summary": "QSA sparse prefill launch geometry on HCU",
+        "backends": {"triton": {"status": "candidate", "note": "gfx936 uses 64/1 through 64 rows and 32/2 above to fit the 64 KiB LDS budget; conservative for all head dimensions."}},
+    },
+    "qsa_mqa": {
+        "var": None, "summary": "QSA indexer MQA on HCU",
+        "backends": {
+            "boltops": {"status": "candidate", "note": "gfx936 BF16 QSA indexer with four 128-wide query heads; ragged prefill and paged decode. HCU_DISABLE_OPS=qsa_mqa selects the Torch reference."},
+            "torch": {"status": "candidate", "note": "Official Torch reference for unsupported geometry or disabled BoltOPs; in-tree HIP TileLang remains disabled."},
+        },
+    },
+    "qsa_scatter": {
+        "var": None,
+        "summary": "QSA state and compressed-key row stores on HCU",
+        "backends": {"triton": {"status": "candidate", "note": "No host sync; duplicate destination zero is a reserved dump slot"}},
+    },
+    "mapped_host_view": {
+        "var": None,
+        "summary": "DTK mapped CPU allocation exposed as a device tensor",
+        "backends": {"dtk": {"status": "candidate", "note": "INT8/BF16/FP8 live-ID Graph replay passed on gfx936; caller retains host allocation"}},
+    },
     "vllm_sparse_indexer": {
         "var": "HCU_VLLM_SPARSE_INDEXER_IMPL",
         "summary": "vLLM 0.33 C4 sparse indexer through public OOT and official helpers",
@@ -83,10 +201,37 @@ BACKEND_CATALOG = {
     },
     "vllm_mhc": {
         "var": "HCU_VLLM_MHC_IMPL",
-        "summary": "vLLM 0.33 mHC compatibility; official Torch math via public OOT",
+        "summary": "vLLM 0.33 mHC via public OOT; AITER project with TileLang stage2 by default",
         "backends": {
-            "stock": {"status": "candidate", "note": "Default unchanged upstream; diagnostic rollback, known gfx936 pre/fused failures"},
-            "torch": {"status": "candidate", "note": "Opt-in gfx936 official pre/post and public IR RMS; post/head unchanged; installed/model gates pending"},
+            "stock": {"status": "candidate", "note": "No longer the adapter default; explicit opt-out to the upstream path, diagnostic rollback, known gfx936 pre/fused failures"},
+            "torch": {"status": "candidate", "note": "Opt-in gfx936/gfx938 official pre/post and public IR RMS; post/head unchanged; independent model gates remain candidate"},
+            "aiter": {"status": "candidate", "note": "Default gfx936/gfx938 AITER project plus TileLang pre_big_fuse stage2 through public OOT; missing TileLang uses official Torch rather than legacy big_fuse; gfx938 W4A8 eager operator parity and HumanEval 160/164 passed; Graph and other models pending"},
+        },
+    },
+    "vllm_scaled_mm": {
+        "var": None,
+        "summary": "vLLM native FP8/INT8 Linear execution through LightOp with official Triton fallback",
+        "backends": {
+            "auto": {"status": "candidate", "note": "LightOp when installed: INT8 gfx936/gfx938, E4M3FN gfx938; metadata fallback to official Triton; model/performance gates pending"},
+            "lightop": {"status": "candidate", "note": "Require LightOp wheel; native quantization/loading and asymmetric INT8 correction preserved; unsupported contracts use Triton"},
+            "triton": {"status": "validated", "note": "Preserve official providers without execution rebinding; diagnostic startup rollback"},
+        },
+    },
+    "vllm_minimax_prefill": {
+        "var": None,
+        "summary": "MiniMax PCP8 native-MSA prefill and static-selector fusion (Plugin provider)",
+        "backends": {
+            "triton": {"status": "candidate", "note": "Default in the admitted MiniMax path: fused cache/Q/local-pages, stream-owned scratch, metadata reuse, device scale guard and dynamic selector; full model quality remains separate"},
+            "stock": {"status": "candidate", "note": "Explicit startup comparison: preserve unfused prefill and original static selector"},
+        },
+    },
+    "vllm_minimax_qknorm_abi": {
+        "var": None,
+        "summary": "vLLM MiniMax fused qknorm native ABI compatibility",
+        "backends": {
+            "native-25": {"status": "candidate",
+                "note": "Exact audited wrapper and old native schema only; write_qkv=True, "
+                        "aliases preserved. False or drift refused; GPU model/graph gates pending."},
         },
     },
     "vllm_fp8_linear": {
@@ -113,15 +258,71 @@ BACKEND_CATALOG = {
         "var": None, "summary": "vLLM AR-only gate compatibility; global AITER and real architecture unchanged",
         "backends": {"official-aiter-gate": {"status": "candidate", "note": "Existing HCU kill/resolver policy; available != selected; official fusion pass remains globally gated"}},
     },
+    "sglang_grouped_topk": {
+        "var": None,
+        "summary": "SGLang biased single-group MoE routing",
+        "backends": {
+            "torch": {"status": "validated", "note": "Default current upstream dispatch"},
+            "triton": {
+                "status": "candidate",
+                "note": "Opt-in upstream fused router for FP32 288-expert top8 "
+                        "single-group prefill M>=32; preserves renormalize epsilon and "
+                        "fallback. Full-model validation pending.",
+            },
+        },
+    },
+    "int8_scaled_mm": {
+        "var": None,
+        "summary": "SGLang symmetric per-token/per-channel INT8 dense GEMM",
+        "backends": {
+            "triton": {"status": "validated", "note": "Default stride-aware INT32 accumulation with FP32 scales and optional bias"},
+            "lightop": {"status": "candidate", "note": "Opt-in BF16 prefill M>=32, K multiple128, N multiple64, column-major weight, no bias; other cases retain Triton. Full-model validation pending."},
+            "hipblaslt": {
+                "status": "candidate",
+                "note": "Opt-in LightOp hipBLASLt for bias-free GEMM; biased calls retain Triton.",
+            },
+        },
+    },
+    "hicache_mla_transfer": {
+        "var": None,
+        "summary": "MLA HiCache byte transfers through device pointer tables and pinned host memory",
+        "backends": {
+            "triton": {"status": "candidate", "note": "Layer-first and page-first MLA transfers; model validation pending"},
+        },
+    },
+    "sglang_mla_sparse": {
+        "var": None,
+        "summary": "SGLang BF16 NoPE sparse MLA interface",
+        "backends": {
+            "emu": {"status": "candidate", "note": "Default Torch compatibility implementation"},
+            "dtk": {"status": "candidate", "note": "Opt-in H1-64 D512 topk2048-2112 native FlashMLA; unsupported shapes retain emulation; full model validation pending"},
+        },
+    },
+    "sglang_mla_fp8": {
+        "var": None,
+        "summary": "SGLang V32_NO_ROPE packed E4M3 sparse MLA decode",
+        "backends": {
+            "emu": {"status": "candidate",
+                    "note": "SGLang-only 528-byte rows; FP32 attention; model validation pending"},
+        },
+    },
     "silu_and_mul": {
         "var": "HCU_SILU_MUL_IMPL",
         "summary": "gated activation out = silu(x[:,:d]) * x[:,d:]",
         "backends": {
             "triton": {"status": "production",
-                       "note": "default (auto); fp32 accumulate"},
+                       "note": "auto ladder fallback (lightop > aiter > "
+                               "triton); fp32 accumulate. JIT is excluded "
+                               "from this op's ladder: 33-49 s cold ninja "
+                               "build (PR #96)"},
             "lightop": {"status": "validated",
-                        "note": "lightop.fuse_silu_and_mul "
+                        "note": "auto first when lightop imports; "
+                                "lightop.fuse_silu_and_mul "
                                 "(input, output, mask_m, expect_m)"},
+            "aiter": {"status": "candidate",
+                      "note": "real wheel aiter.silu_and_mul(out, input, "
+                              "limit=0.0) only — the adapter's aiter stub "
+                              "delegates back here and is skipped"},
             "torch": {"status": "production",
                       "note": "reference path, eager debug"},
         },
@@ -130,12 +331,18 @@ BACKEND_CATALOG = {
         "var": "HCU_RMS_NORM_IMPL",
         "summary": "RMSNorm (plain); the fused-add family is its own op below",
         "backends": {
-            "triton": {"status": "production", "note": "default"},
+            "triton": {"status": "production",
+                       "note": "auto ladder fallback (lightop > aiter > "
+                               "triton); also the dtype fallback when "
+                               "lightop/aiter cannot serve the call"},
             "aiter": {"status": "candidate",
-                      "note": "aiter.rmsnorm_forward(x,w,eps,training) "
-                              "-> (out, ..); plain rmsnorm only"},
+                      "note": "auto second; aiter.rmsnorm_forward(x,w,eps,"
+                              "training) -> (out, ..); plain bf16/fp16 "
+                              "rmsnorm only"},
             "lightop": {"status": "candidate",
-                        "note": "Public BF16 plain RMSNorm; other dtypes/Gemma use Triton"},
+                        "note": "auto first when lightop imports; Public "
+                                "BF16 plain RMSNorm; other dtypes/Gemma use "
+                                "the lower tiers"},
             "torch": {"status": "production",
                       "note": "reference path"},
         },
@@ -144,15 +351,20 @@ BACKEND_CATALOG = {
         "var": "HCU_FUSED_ADD_RMS_IMPL",
         "summary": "residual += input; input = rmsnorm(residual)*w, in-place",
         "backends": {
-            "triton": {"status": "production", "note": "default (auto)"},
+            "triton": {"status": "production",
+                       "note": "auto ladder fallback (lightop > triton; "
+                               "aiter exports no fused-add face); also the "
+                               "dtype fallback"},
             "lightop": {"status": "validated",
-                        "note": "lightop.fused_add_rms_norm(x, residual, w, "
-                                "eps, limit=-1) in-place; gemma variant "
-                                "gemma_fused_add_rmsnorm; parity + cuda-graph "
-                                "replay passed 2026-11-03 (dtk2610/BW200, "
-                                "py3.10 wheel has both fns too); perf 0.76x "
-                                "vs triton @4096x7168 bf16 — triton stays "
-                                "default; one-strike fallback on a raise"},
+                        "note": "auto first (2026-11 tier order) for "
+                                "bf16/fp16; lightop.fused_add_rms_norm(x, "
+                                "residual, w, eps, limit=-1) in-place; gemma "
+                                "variant gemma_fused_add_rmsnorm; parity + "
+                                "cuda-graph replay passed 2026-11-03 "
+                                "(dtk2610/BW200, py3.10 wheel has both fns "
+                                "too); perf 0.76x vs triton @4096x7168 bf16 "
+                                "(standby: HCU_FUSED_ADD_RMS_IMPL=triton); "
+                                "one-strike fallback on a raise"},
             "torch": {"status": "production",
                       "note": "reference path"},
         },
@@ -247,14 +459,21 @@ BACKEND_CATALOG = {
                  "deepgemm": {"HCU_MQA_LOGITS_IMPL": "vendor"}},
         "summary": "DSA paged MQA logits",
         "backends": {
-            "emu": {"status": "production",
-                    "note": "torch emulation — correct opt-out "
+            "emu": {"status": "candidate",
+                    "note": "2026-10-30: restored upstream per-head ReLU before "
+                            "weighted reduction; earlier parity shared the same "
+                            "missing-ReLU bug. Corrected long-context serving pending. "
+                            "torch emulation — opt-out "
                             "(HCU_MQA_LOGITS_IMPL=vec; pre-R-13#4 default)"},
             "triton": {"status": "production",
-                       "note": "homegrown triton kernel (mqa_logits_triton.py, "
-                               "R-02 2026-10-18) — DEFAULT since R-13 #4 "
-                               "promotion 2026-10-18 (HCU_MQA_LOGITS_IMPL, "
-                               "was emu-vec). Reads the production "
+                       "note": "auto ladder landing tier (lightop is "
+                               "explicit-only above it, aiter planned): "
+                               "homegrown triton kernel "
+                               "(mqa_logits_triton.py, R-02 2026-10-18) — "
+                               "effective default since R-13 #4 promotion "
+                               "2026-10-18 (HCU_MQA_LOGITS_IMPL=auto "
+                               "delegates here; was emu-vec). Reads the "
+                               "production "
                                "pool layout (writer census: GLM-5.3 "
                                "IndexerKPool/kpool=4 writes via the kpool "
                                "family + SetKAndS under the forced "
@@ -288,8 +507,12 @@ BACKEND_CATALOG = {
                               "wheel ships no paged_mqa_logits API -- "
                               "revisit when the wheel grows one"},
             "lightop": {"status": "planned",
-                        "note": "lightop.attention.paged_mqa_logits; "
-                                "gate pending"},
+                        "note": "lightop.gemmopt.paged_mqa_logits wired "
+                                "through HCU_MQA_LOGITS_IMPL=lightop only "
+                                "(explicit A/B); auto skips it until the "
+                                "gate lands — an unvalidated kernel that "
+                                "does not raise would silently corrupt the "
+                                "auto ladder"},
             "deepgemm": {"status": "broken",
                          "note": "deepgemm wheel direct call via "
                                  "mqa_vendor.py bridge. Layout contract "
@@ -316,6 +539,14 @@ BACKEND_CATALOG = {
                                  "tests/kernels/test_mqa_vendor_gfx938.py"},
         },
     },
+    "minimax_h3_rotary_embedding": {
+        "var": None,
+        "summary": "MiniMax-H3 NeoX partial RoPE: DiT128/96 and VAE64/48; native preferred by plugin",
+        "backends": {
+            "triton": {"status": "candidate", "note": "BF16/FP16/FP32 old-native canonical parity passed; changed-input Graph passed; serving pending"},
+            "torch": {"status": "candidate", "note": "CPU contract and diagnostic fallback; no serving claim"},
+        },
+    },
     "rotary_embedding": {
         "var": None,
         "summary": "RoPE NeoX triton in place; GPT-J interleave = torch",
@@ -338,6 +569,90 @@ BACKEND_CATALOG = {
                               "biased_grouped_topk"},
             "lightop": {"status": "planned",
                         "note": "fast_topk_transform_* family"},
+        },
+    },
+    "merge_state_v2": {
+        "var": None,
+        "summary": "LSE-exact merge of two partial attention states "
+                   "(MTP verify / cascade)",
+        "backends": {
+            "triton": {"status": "production",
+                       "note": "fp32 FMA, ±inf lse -> -inf; all-masked "
+                               "rows -> 0/-inf (FA emu contract; upstream "
+                               "CUDA wheel emits NaN there — anchored "
+                               "divergence, see "
+                               "tests/kernels/test_aot_contract_b_class.py)"},
+            "cpp": {"status": "production",
+                    "note": "setup_hip.py wheel (merge_attn_states.cu port "
+                            "from sglang-das); all-masked rows arrive NaN "
+                            "from the kernel and are nan_to_num'd to the "
+                            "pinned 0/-inf in the python wrapper"},
+            "emu": {"status": "production",
+                    "note": "torch fallback (CPU / no-triton); optional "
+                            "v_merged/s_merged out params per upstream "
+                            "python wrapper"},
+        },
+    },
+    "concat_mla": {
+        "var": None,
+        "summary": "MLA concat copies: concat_mla_k (in-place "
+                   "(T,128,192)), concat_mla_absorb_q (allocating "
+                   "(...,576))",
+        "backends": {
+            "triton": {"status": "production",
+                       "note": "row-copy kernel; bf16/3D/unit-stride/16B "
+                               "contract checks mirror concat_mla.cu"},
+            "cpp": {"status": "production",
+                    "note": "setup_hip.py wheel: concat_mla_absorb_q_hcu.cu "
+                            "(as-is from sglang-das) + concat_mla_k_hcu.cu "
+                            "(plain uint4 rewrite — the CUDA original rides "
+                            "NV PTX no-allocate intrinsics)"},
+            "emu": {"status": "production",
+                    "note": "strided torch copies / torch.cat fallback"},
+        },
+    },
+    "copy_to_gpu_no_ce": {
+        "var": None,
+        "summary": "small pinned int32 H2D, N in {32,64,72} "
+                   "(upstream copy.cu)",
+        "backends": {
+            "emu": {"status": "production",
+                    "note": "output.copy_(input); the upstream no-CE trick "
+                            "(values in kernel launch params) is "
+                            "CUDA-runtime-only — numerically identical, "
+                            "mechanism differs (no triton equivalent)"},
+            "cpp": {"status": "production",
+                    "note": "setup_hip.py wheel: the REAL no-CE path "
+                            "(copy.cu InputArray — values ride the kernel "
+                            "launch parameters, which the HIP runtime "
+                            "supports too)"},
+        },
+    },
+    "per_token_group_quant_8bit": {
+        "var": None,
+        "summary": "sgl_per_token_group_quant_8bit bridge, v1 + v2 "
+                   "variants (C-class gap: the python seam was missing "
+                   "entirely — callers hit AttributeError)",
+        "backends": {
+            "emu": {"status": "production",
+                    "note": "torch ports of both upstream kernels; v1: "
+                            "eps-floor amax, x/y_s division, int8 cast "
+                            "TRUNCATES; v2: eps==1e-10 enforced, min/max "
+                            "must match dst dtype, two scale directions "
+                            "(stored dequant scale_inv; the quant "
+                            "multiplier is its reciprocal), ue8m0 via "
+                            "DeepEP fast_log2_ceil bits, fuse_silu_and_mul "
+                            "in input dtype, DeepEP masked_m layout read "
+                            "ON DEVICE (graph-capturable). "
+                            "Contract anchors: "
+                            "tests/kernels/test_aot_contract_quant.py"},
+            "cpp": {"status": "production",
+                    "note": "setup_hip.py wheel: plain 16-lane-per-group "
+                            "ports of both variants (no flashinfer vec_t / "
+                            "PDL / NV PTX); contracts bit-identical incl. "
+                            "int8 truncation and packed ue8m0 column-major "
+                            "scales; masked_m row limit read on device "
+                            "(per-expert row guard) — graph-capturable"},
         },
     },
     "platform_detect": {
@@ -381,6 +696,22 @@ BACKEND_CATALOG = {
                               "note": "common.np.frombuffer 代理返回可写副本"},
         },
     },
+    "fused_a_gemm": {
+        "var": None,
+        "summary": "DeepSeek-V3 fused QKV-A GEMM 最小延迟路径 "
+                   "(deepseek_v2 prepare_qkv_latent / q_b_proj_forward、"
+                   "nemotron_h latent MLP)",
+        "backends": {
+            "cuda-only-kernel-off": {
+                "status": "candidate",
+                "note": "HIP 恒不具备：kernel 仅 __CUDA_ARCH__>=900，且申请"
+                        "约 192KB 动态 LDS（本机 64KB/block），capture 期 "
+                        "set_max_dynamic_smem 报 invalid argument；资格判定 "
+                        "rebind 为 False 后各层走自身 linear。注册/dispatch "
+                        "契约已覆盖，模型级验收归全量模型双机服务",
+            },
+        },
+    },
     "triton_pdl": {
         "var": None,
         "summary": "triton 编译期 PDL 指令剥离（行为还原：gfx936 无 "
@@ -408,7 +739,10 @@ BACKEND_CATALOG = {
                        "note": "DTK flash_attn 2.8.4 wheel（gfx93x kernel）；"
                                "uniform-window 离线对拍逐位等，但真实 decode "
                                "词汤（2026-10-12 bw7，gfx936 wheel paged 内核"
-                               "问题）；=vendor 显式 opt-in 做 A-B"},
+                               "问题）；=vendor 显式 opt-in 做 A-B。"
+                               "非分页 BF16/FP16 dense/packed FA2 桥保留 batch、"
+                               "out、LSE 与已缓存 dispatcher 入口；"
+                               "vendor_fa 快关回 triton，见 docs/dense-flashattention.md"},
             "emu": {"status": "production",
                     "note": "chunked online-softmax torch 模拟（默认；全契约 "
                             "graph-safe）"},
@@ -456,6 +790,14 @@ BACKEND_CATALOG = {
                                "triton core passes serving A/B."},
         },
     },
+    "sglang_tree_sampling": {
+        "var": None,
+        "summary": "SGLang target-only speculative tree sampling",
+        "backends": {
+            "triton": {"status": "candidate",
+                       "note": "Tree traversal, residual mass and CDF sampling; FP32 contiguous upstream ABI; full stochastic serving pending"},
+        },
+    },
     "sampling": {
         "var": None,
         "summary": "top-k/top-p/min-p renorm+sample（§0.5 is_cuda sampler 面）",
@@ -472,15 +814,33 @@ BACKEND_CATALOG = {
         "summary": "GDN/gated-delta-rule 线性注意力（sglang fla 面）",
         "backends": {
             "triton": {"status": "production",
-                       "note": "上游 fla triton 核（auto 默认；gfx93x "
-                               "wave64 友好，BT=64）"},
+                       "note": "上游 fla triton 核（auto 末档 / aiter 失败"
+                               "回退；gfx93x wave64 友好，BT=64）"},
             "aiter": {"status": "validated",
-                      "note": "DTK aiter CK/triton 核路由（fwd_h 状态递推 "
+                      "note": "auto 首选（2026-11 档位：aiter > triton）："
+                              "DTK aiter CK/triton 核路由（fwd_h 状态递推 "
                               "blockdim64 + packed decode 同契约直换绑，"
                               "K=V=128）：门禁 6/6（h 逐位一致、状态池写回 "
                               "≤1e-4 fp32 舍入）+ Qwen3.5-27B TP4 e2e 四锚点"
                               "全对（2026-10-13 bw7）；decode graph 36 桶捕"
-                              "获 577s→20.9s；=aiter 显式启用"} ,
+                              "获 577s→20.9s；=aiter 显式启用，=triton "
+                              "强制上游核"} ,
+        },
+    },
+    "linear_attn_gdn_verify": {
+        "var": "HCU_LINEAR_ATTN_GDN_VERIFY",
+        "summary": "SGLang GDN MTP target verification",
+        "backends": {
+            "auto": {"status": "production",
+                     "note": "default policy: qualified DTK2610 stack, BF16 packed "
+                             "H8/HV24, FP32 state/snapshots, gfx936/gfx938, no fixed batch ceiling, draft4 -> AITER; "
+                             "other environments/contracts retain upstream"},
+            "triton": {"status": "production",
+                       "note": "explicit upstream rollback; also auto fallback"},
+            "aiter": {"status": "validated",
+                      "note": "vendor verify bridge in gdn_aiter.py; BF16 K=V=128, FP32 "
+                              "contiguous state/snapshots; gfx936 eager/Graph reference "
+                              "and Qwen3.6 TP2 MATH500/serving passed 2026-11-14"},
         },
     },
     "fused_moe": {
@@ -494,7 +854,7 @@ BACKEND_CATALOG = {
                       "note": "DTK aiter_moe; blockwise->ASM tuned csv, "
                               "channelwise->moe_c; rel 0.02-0.04 gate "
                               "PASS (validation-host-18 gfx938); unlisted shapes "
-                              "auto-fallback to triton"},
+                              "auto-fallback to triton; swiglu_limit overrides gemm1_clamp_limit at the vendor boundary"},
         },
     },
     "flashmla_kv_indices": {
@@ -628,7 +988,10 @@ BACKEND_CATALOG = {
                               "异形臂恒走上游、aiter 失败 log-once 回退；"
                               "production 晋级待 fp8 模型 serving A/B"},
             "lightop": {"status": "planned",
-                        "note": "per-token quant family"},
+                        "note": "per-token quant family wired through "
+                                "HCU_QUANT_IMPL=lightop (explicit A/B; "
+                                "group/rowwise/fused probe the wheel and "
+                                "fall back per arm); auto stays aiter"},
         },
     },
 }
