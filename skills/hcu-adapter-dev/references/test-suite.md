@@ -43,6 +43,10 @@ kernel/provider import；named consumer 回归不得冒称 SGLang engine 试验�
 
 vLLM 启动编排测试应显式隔离当前所有 provider 的安装边界（包括 MiniMax
 ABI），并断言顺序；遗漏新 owner 会让 CPU 顺序测试意外导入真实设备路径。
+`test_review_startup_contracts.py` 的跨版本/架构作用范围回归保留真实 MHC、
+FlashMLA decode、宿主回调与锁存；MiniMax ABI 只替身独立安装边界，并记录
+只安装一次、拒绝意外 provider import。该替身不证明 MiniMax ABI 或设备通过，
+其真实 wrapper/schema 合同仍由专门测试及配套安装/设备验收负责。
 组合健康测试使用真实 `ProcessLocalActions`，逐个覆盖内建 owner 的失败短路、
 激活期间的暂缓聚合及返回后的完整检查；同时验证已锁存的宿主错误在激活仍
 进行时也先拒绝。不要用缺少生命周期接口的 `SimpleNamespace` 或全局健康

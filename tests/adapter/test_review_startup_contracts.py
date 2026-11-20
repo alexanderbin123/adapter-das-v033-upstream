@@ -172,6 +172,14 @@ def test_general_plugin_does_not_require_v41_features(monkeypatch, arch, version
         monkeypatch.setattr(owner, action, lambda: None)
         if hasattr(owner, 'require_healthy'):
             monkeypatch.setattr(owner, 'require_healthy', lambda: None)
+    # This scope regression leaves MHC/decode real. MiniMax owns a separate
+    # native ABI contract and must not pull a device into this CPU test.
+    minimax = importlib.import_module('hcu_adapter.bridges.vllm_minimax_abi')
+    unrelated_calls = []
+    monkeypatch.setattr(minimax, 'install',
+                        lambda: unrelated_calls.append('minimax'))
+    monkeypatch.setattr(minimax, 'import_module',
+                        lambda name: pytest.fail('unrelated MiniMax import: ' + name))
     monkeypatch.setattr(host, 'activate_extensions', lambda context, **kwargs: ())
     monkeypatch.delenv('HCU_ADAPTER_VLLM_REQUIRED_EXTENSIONS', raising=False)
     monkeypatch.delenv('HCU_ADAPTER_VLLM_REQUIRED_CAPABILITIES', raising=False)
@@ -180,6 +188,7 @@ def test_general_plugin_does_not_require_v41_features(monkeypatch, arch, version
         host.hcu_runtime_plugin()
         host.require_runtime_healthy()
         assert mhc._publication is None and decode._publication is None
+        assert unrelated_calls == ['minimax']
     finally:
         importlib.reload(mhc)
         importlib.reload(decode)
