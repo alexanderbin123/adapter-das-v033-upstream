@@ -9,6 +9,7 @@ import pytest
 
 from hcu_adapter.bridges import vllm as bridge
 from hcu_adapter.infra import extensions
+from test_vllm_bridge import _stub_runtime_owners
 
 
 @dataclass
@@ -33,40 +34,13 @@ def startup(monkeypatch):
     # Required-extension policy has no device/runtime prerequisites. Native ABI
     # and FP8 registration are exercised by their dedicated contract tests.
     monkeypatch.setattr(bridge, "_require_vllm_hip_runtime_abi", lambda: None)
-    from hcu_adapter.bridges import vllm_allreduce
-    monkeypatch.setattr(vllm_allreduce, "prepare_runtime", lambda: None)
+    # Keep the real runtime callback and required-extension policy, while the
+    # shared helper isolates every unrelated provider's install/health pair.
+    # In particular, sparse FlashMLA/HY4 must not publish process-wide owners
+    # into these policy and empty-owner fork fixtures.
+    _stub_runtime_owners(monkeypatch)
     from hcu_adapter.infra import kill_switch
     monkeypatch.setattr(kill_switch, "log_state", lambda: None)
-    from hcu_adapter.bridges import vllm_minimax_abi
-    monkeypatch.setattr(vllm_minimax_abi, "install", lambda: False)
-    from hcu_adapter.bridges import vllm_fp8
-    monkeypatch.setattr(vllm_fp8, "install", lambda: False)
-    # Required-policy CPU fixtures isolate startup admission. Scaled-MM provider
-    # installation imports a device-specific LightOp module and has separate
-    # backend/runtime tests; do not initialize a GPU from this policy test.
-    from hcu_adapter.bridges import vllm_scaled_mm
-    monkeypatch.setattr(vllm_scaled_mm, "install", lambda: False)
-    # These tests exercise required-policy plumbing, not V4.1 bridge policy.
-    # FlashMLA/PCP have their own admission tests and require release/config
-    # context; keep the CPU runtime fixture independent of them.
-    from hcu_adapter.bridges import vllm_flashmla, vllm_flashmla_decode, vllm_pcp
-    for module in (vllm_flashmla, vllm_flashmla_decode, vllm_pcp):
-        monkeypatch.setattr(module, "install", lambda: False)
-        monkeypatch.setattr(module, "require_healthy", lambda: None, raising=False)
-    # AllReduce preparation has dedicated runtime/ABI tests; keep these
-    # required-policy fixtures independent of its configuration and providers.
-    from hcu_adapter.bridges import vllm_allreduce
-    monkeypatch.setattr(vllm_allreduce, "prepare_runtime", lambda: None)
-    # Required-policy CPU fixtures isolate operator activation. The real C4
-    # publication, health and startup paths have their own contracts/probes.
-    from hcu_adapter.bridges import vllm_sparse_indexer
-    monkeypatch.setattr(vllm_sparse_indexer, "install", lambda: False)
-    monkeypatch.setattr(vllm_sparse_indexer, "require_healthy", lambda: None)
-    # Keep this CPU required-policy fixture independent of optional mHC
-    # startup policy and its real publication/cache/health tests.
-    from hcu_adapter.bridges import vllm_mhc
-    monkeypatch.setattr(vllm_mhc, "install", lambda: False)
-    monkeypatch.setattr(vllm_mhc, "require_healthy", lambda: None)
     monkeypatch.setattr(bridge, "_installed_adapter_version", lambda: "test")
     monkeypatch.setattr(bridge, "_RUNTIME_ACTIONS", bridge.ProcessLocalActions())
     checks = []
