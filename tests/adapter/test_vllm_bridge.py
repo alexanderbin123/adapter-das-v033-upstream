@@ -49,6 +49,15 @@ def _stub_runtime_owners(monkeypatch, calls=None, *, preserve=()):
         if hasattr(owner, 'require_healthy'):
             monkeypatch.setattr(owner, 'require_healthy', lambda: None)
 
+    # The profile publishes into both the process-wide runner factory and
+    # Adapter registry. Ordering/latch doubles must not publish that real owner
+    # into temporary registries or inherit it in the empty-owner fork tests.
+    if 'hy4_pcp_profile' not in preserve:
+        owner = import_module('hcu_adapter.features.hy4.pcp_profile')
+        monkeypatch.setattr(owner, 'install',
+            lambda: calls.append('hy4-profile') if calls is not None else None)
+        monkeypatch.setattr(owner, 'require_healthy', lambda: None)
+
 
 @pytest.mark.parametrize(
     "version",
@@ -327,7 +336,7 @@ def test_runtime_plugin_runs_guards_then_extensions_once_and_keeps_reports(
         "dtk",
         "runtime-abi",
         "fp8",
-        "scaled-mm", "allreduce", "mhc", "indexer", "sparse-flashmla", "prefill", "decode", "pcp", "minimax-abi",
+        "scaled-mm", "allreduce", "mhc", "indexer", "sparse-flashmla", "hy4-profile", "prefill", "decode", "pcp", "minimax-abi",
         "adapter-version",
         ("extensions", "0.1.0", "0.32.0+rocm723"),
     ]

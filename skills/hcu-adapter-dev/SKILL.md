@@ -375,3 +375,11 @@ MiniMax 新能力的环境治理：新功能不再引入私有 env；适用契�
 `docs/dense-flashattention.md`；partial RoPE、输出布局、预导入消费者和
 变输入 Graph 的回归要求见 `references/test-suite.md`。原生崩溃先定位栈，
 部署规避须回到原模型验证，一次性调试过程留任务证据。
+
+
+vLLM 的共享 CPU 启动夹具新增 provider 时同步隔离 install 与健康查询；
+HY4 profile 同时发布 runner factory 和 Adapter registry，仅重置一边会触发
+真实 ownership 锁存，也会污染测试空工厂的 fork 用例。被测 owner 用 preserve
+保留真实路径，其他 owner 用边界 double；独立 ownership/fork 测试仍执行真实
+保护，不以清除生产锁存修复测试。后端枚举 double 覆盖当前 selector 实际读取
+的成员，不能因旧夹具缺少 FLASHMLA_SPARSE 而放宽生产选择器。
