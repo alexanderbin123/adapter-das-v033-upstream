@@ -66,6 +66,13 @@ checkout 可通过包符号链接指向安装目录；解析声明文件与实�
 不能用模块是否位于 checkout 目录下判断，也不能省略外来根的拒绝对照。fresh-process 生命周期探针在子进程中
 显式不选择无关 provider，保留原健康查询与超时；父进程配置不变。
 
+CPU spawn 探针返回 payload 后仍须满足原进程退出门禁；join 失败时，先记录
+已收到结果及 PID，再在原失败之后、清理之前抓取 Python/原生栈。Torch 报告
+CUDA 未初始化不等于未加载 HIP native 库，退出可能停在 DTK HIPNN 析构。
+物理隐藏 KFD/MKFD 与只清空设备 visibility 分别留证；单次任一对照通过不证明
+节点可见性、GC、DBO 或具体 owner 的因果，也不清除原失败。保留原 deadline
+和原清理，不用 os._exit、放宽 join 或省略 native 析构使门禁变绿。
+
 vLLM 扩展生命周期：source 与独立 wheel installed 分开跑。check_health 的
 必需参数须在激活前拒绝；报告替换/重复、sink 失败、caught error 后其他
 selector、实际 fork 格式化窗口均需断言。public registry clear/foreign 必须
